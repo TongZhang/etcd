@@ -20,13 +20,13 @@ import (
 	"strings"
 	"time"
 
-	etcdErr "github.com/coreos/etcd/error"
-	"github.com/coreos/etcd/etcdserver"
+	"github.com/coreos/etcd/etcdserver/api/etcdhttp"
+	"github.com/coreos/etcd/etcdserver/api/v2auth"
 	"github.com/coreos/etcd/etcdserver/api/v2http/httptypes"
-
-	"github.com/coreos/etcd/etcdserver/auth"
 	"github.com/coreos/etcd/pkg/logutil"
+
 	"github.com/coreos/pkg/capnslog"
+	"go.uber.org/zap"
 )
 
 const (
@@ -39,37 +39,27 @@ var (
 	mlog = logutil.NewMergeLogger(plog)
 )
 
-// writeError logs and writes the given Error to the ResponseWriter
-// If Error is an etcdErr, it is rendered to the ResponseWriter
-// Otherwise, it is assumed to be a StatusInternalServerError
-func writeError(w http.ResponseWriter, r *http.Request, err error) {
+func writeError(lg *zap.Logger, w http.ResponseWriter, r *http.Request, err error) {
 	if err == nil {
 		return
 	}
-	switch e := err.(type) {
-	case *etcdErr.Error:
-		e.WriteTo(w)
-	case *httptypes.HTTPError:
-		if et := e.WriteTo(w); et != nil {
-			plog.Debugf("error writing HTTPError (%v) to %s", et, r.RemoteAddr)
-		}
-	case auth.Error:
+	if e, ok := err.(v2auth.Error); ok {
 		herr := httptypes.NewHTTPError(e.HTTPStatus(), e.Error())
 		if et := herr.WriteTo(w); et != nil {
-			plog.Debugf("error writing HTTPError (%v) to %s", et, r.RemoteAddr)
+			if lg != nil {
+				lg.Debug(
+					"failed to write v2 HTTP error",
+					zap.String("remote-addr", r.RemoteAddr),
+					zap.String("v2auth-error", e.Error()),
+					zap.Error(et),
+				)
+			} else {
+				plog.Debugf("error writing HTTPError (%v) to %s", et, r.RemoteAddr)
+			}
 		}
-	default:
-		switch err {
-		case etcdserver.ErrTimeoutDueToLeaderFail, etcdserver.ErrTimeoutDueToConnectionLost, etcdserver.ErrNotEnoughStartedMembers, etcdserver.ErrUnhealthy:
-			mlog.MergeError(err)
-		default:
-			mlog.MergeErrorf("got unexpected response error (%v)", err)
-		}
-		herr := httptypes.NewHTTPError(http.StatusInternalServerError, "Internal Server Error")
-		if et := herr.WriteTo(w); et != nil {
-			plog.Debugf("error writing HTTPError (%v) to %s", et, r.RemoteAddr)
-		}
+		return
 	}
+	etcdhttp.WriteError(lg, w, r, err)
 }
 
 // allowMethod verifies that the given method is one of the allowed methods,
@@ -86,9 +76,18 @@ func allowMethod(w http.ResponseWriter, m string, ms ...string) bool {
 	return false
 }
 
-func requestLogger(handler http.Handler) http.Handler {
+func requestLogger(lg *zap.Logger, handler http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		plog.Debugf("[%s] %s remote:%s", r.Method, r.RequestURI, r.RemoteAddr)
+		if lg != nil {
+			lg.Debug(
+				"handling HTTP request",
+				zap.String("method", r.Method),
+				zap.String("request-uri", r.RequestURI),
+				zap.String("remote-addr", r.RemoteAddr),
+			)
+		} else {
+			plog.Debugf("[%s] %s remote:%s", r.Method, r.RequestURI, r.RemoteAddr)
+		}
 		handler.ServeHTTP(w, r)
 	})
 }

@@ -15,15 +15,15 @@
 package rafttest
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	"github.com/coreos/etcd/raft"
-	"golang.org/x/net/context"
 )
 
 func BenchmarkProposal3Nodes(b *testing.B) {
-	peers := []raft.Peer{{1, nil}, {2, nil}, {3, nil}}
+	peers := []raft.Peer{{ID: 1, Context: nil}, {ID: 2, Context: nil}, {ID: 3, Context: nil}}
 	nt := newRaftNetwork(1, 2, 3)
 
 	nodes := make([]*node, 0)

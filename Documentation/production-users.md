@@ -59,7 +59,7 @@ Radius Intelligence uses Kubernetes running CoreOS to containerize and scale int
 
 ## Vonage
 
-- *Application*: system configuration for microservices, scheduling, locks (future - service discovery)
+- *Application*: kubernetes, vault backend, system configuration for microservices, scheduling, locks (future - service discovery)
 - *Launched*: August 2015
 - *Cluster Size*: 2 clusters of 5 members in 2 DCs, n local proxies 1-to-1 with microservice, (ssl and SRV look up)
 - *Order of Data Size*: kilobytes
@@ -79,9 +79,9 @@ Radius Intelligence uses Kubernetes running CoreOS to containerize and scale int
 
 PD(Placement Driver) is the central controller in the TiDB cluster. It saves the cluster meta information, schedule the data, allocate the global unique timestamp for the distributed transaction, etc. It embeds etcd to supply high availability and auto failover.
 
-## Canal
+## Huawei
 
-- *Application*: system configuration for overlay network
+- *Application*: System configuration for overlay network (Canal)
 - *Launched*: June 2016
 - *Cluster Size*: 3 members for each cluster
 - *Order of Data Size*: kilobytes
@@ -104,7 +104,7 @@ PD(Placement Driver) is the central controller in the TiDB cluster. It saves the
 
 ## QingCloud
 
-- *Application*: [QingCloud](qingcloud) appcenter cluster for service discovery as [metad](metad) backend.
+- *Application*: [QingCloud][qingcloud] appcenter cluster for service discovery as [metad][metad] backend.
 - *Launched*: December 2016
 - *Cluster Size*: 1 cluster of 3 members per user.
 - *Order of Data Size*: kilobytes
@@ -186,7 +186,7 @@ In [hyper.sh][hyper.sh], the container service is backed by [hypernetes][hyperne
 - *Cluster Size*: 1000+ deployments, each deployment contains a 3 node cluster.
 - *Order of Data Size*: 100s of Megabytes
 - *Operator*: daocloud.io
-- *Environment*: Baremetal and virtual machines 
+- *Environment*: Baremetal and virtual machines
 - *Backups*: None, all data can be recreated if necessary.
 
 In [DaoCloud][DaoCloud], we use Docker and Swarm to deploy and run our applications, and we use etcd to save metadata for service discovery.
@@ -203,8 +203,9 @@ In [DaoCloud][DaoCloud], we use Docker and Swarm to deploy and run our applicati
 - *Environment*: AWS, Kubernetes
 - *Backups*: EBS volume backups
 
-At Branch, we use kubernetes heavily as our core microservice platform for staging and production. 
-[Branch]:https://branch.io
+At [Branch][branch], we use kubernetes heavily as our core microservice platform for staging and production.
+
+[branch]: https://branch.io
 
 ## Baidu Waimai
 
@@ -213,7 +214,7 @@ At Branch, we use kubernetes heavily as our core microservice platform for stagi
 - *Cluster Size*: 3 clusters of 5 members
 - *Order of Data Size*: several gigabytes
 - *Operator*: Baidu Waimai Operations Department
-- *Environment*: CentOS 6.5 
+- *Environment*: CentOS 6.5
 - *Backups*: backup scripts
 
 ## Salesforce.com
@@ -226,4 +227,13 @@ At Branch, we use kubernetes heavily as our core microservice platform for stagi
 - *Environment*: BareMetal
 - *Backups*: None, all data can be recreated
 
+## Hosted Graphite
+
+- *Application*: Service discovery, locking, ephemeral application data
+- *Launched*: January 2017
+- *Cluster Size*: 2 clusters of 7 members
+- *Order of Data Size*: Megabytes
+- *Operator*: Hosted Graphite (sre@hostedgraphite.com)
+- *Environment*: Bare Metal
+- *Backups*: None, all data is considered ephemeral.
 

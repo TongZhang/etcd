@@ -18,6 +18,7 @@ package auth
 // JWT based mechanism will be added in the near future.
 
 import (
+	"context"
 	"crypto/rand"
 	"fmt"
 	"math/big"
@@ -26,7 +27,7 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/net/context"
+	"go.uber.org/zap"
 )
 
 const (
@@ -41,27 +42,19 @@ var (
 )
 
 type simpleTokenTTLKeeper struct {
-	tokensMu        sync.Mutex
 	tokens          map[string]time.Time
-	stopCh          chan chan struct{}
+	donec           chan struct{}
+	stopc           chan struct{}
 	deleteTokenFunc func(string)
-}
-
-func NewSimpleTokenTTLKeeper(deletefunc func(string)) *simpleTokenTTLKeeper {
-	stk := &simpleTokenTTLKeeper{
-		tokens:          make(map[string]time.Time),
-		stopCh:          make(chan chan struct{}),
-		deleteTokenFunc: deletefunc,
-	}
-	go stk.run()
-	return stk
+	mu              *sync.Mutex
 }
 
 func (tm *simpleTokenTTLKeeper) stop() {
-	waitCh := make(chan struct{})
-	tm.stopCh <- waitCh
-	<-waitCh
-	close(tm.stopCh)
+	select {
+	case tm.stopc <- struct{}{}:
+	case <-tm.donec:
+	}
+	<-tm.donec
 }
 
 func (tm *simpleTokenTTLKeeper) addSimpleToken(token string) {
@@ -80,28 +73,30 @@ func (tm *simpleTokenTTLKeeper) deleteSimpleToken(token string) {
 
 func (tm *simpleTokenTTLKeeper) run() {
 	tokenTicker := time.NewTicker(simpleTokenTTLResolution)
-	defer tokenTicker.Stop()
+	defer func() {
+		tokenTicker.Stop()
+		close(tm.donec)
+	}()
 	for {
 		select {
 		case <-tokenTicker.C:
 			nowtime := time.Now()
-			tm.tokensMu.Lock()
+			tm.mu.Lock()
 			for t, tokenendtime := range tm.tokens {
 				if nowtime.After(tokenendtime) {
 					tm.deleteTokenFunc(t)
 					delete(tm.tokens, t)
 				}
 			}
-			tm.tokensMu.Unlock()
-		case waitCh := <-tm.stopCh:
-			tm.tokens = make(map[string]time.Time)
-			waitCh <- struct{}{}
+			tm.mu.Unlock()
+		case <-tm.stopc:
 			return
 		}
 	}
 }
 
 type tokenSimple struct {
+	lg                *zap.Logger
 	indexWaiter       func(uint64) <-chan struct{}
 	simpleTokenKeeper *simpleTokenTTLKeeper
 	simpleTokensMu    sync.Mutex
@@ -124,81 +119,97 @@ func (t *tokenSimple) genTokenPrefix() (string, error) {
 }
 
 func (t *tokenSimple) assignSimpleTokenToUser(username, token string) {
-	t.simpleTokenKeeper.tokensMu.Lock()
 	t.simpleTokensMu.Lock()
+	defer t.simpleTokensMu.Unlock()
+	if t.simpleTokenKeeper == nil {
+		return
+	}
 
 	_, ok := t.simpleTokens[token]
 	if ok {
-		plog.Panicf("token %s is alredy used", token)
+		if t.lg != nil {
+			t.lg.Panic(
+				"failed to assign already-used simple token to a user",
+				zap.String("user-name", username),
+				zap.String("token", token),
+			)
+		} else {
+			plog.Panicf("token %s is alredy used", token)
+		}
 	}
 
 	t.simpleTokens[token] = username
 	t.simpleTokenKeeper.addSimpleToken(token)
-	t.simpleTokensMu.Unlock()
-	t.simpleTokenKeeper.tokensMu.Unlock()
 }
 
 func (t *tokenSimple) invalidateUser(username string) {
 	if t.simpleTokenKeeper == nil {
 		return
 	}
-	t.simpleTokenKeeper.tokensMu.Lock()
 	t.simpleTokensMu.Lock()
 	for token, name := range t.simpleTokens {
-		if strings.Compare(name, username) == 0 {
+		if name == username {
 			delete(t.simpleTokens, token)
 			t.simpleTokenKeeper.deleteSimpleToken(token)
 		}
 	}
 	t.simpleTokensMu.Unlock()
-	t.simpleTokenKeeper.tokensMu.Unlock()
-}
-
-func newDeleterFunc(t *tokenSimple) func(string) {
-	return func(tk string) {
-		t.simpleTokensMu.Lock()
-		defer t.simpleTokensMu.Unlock()
-		if username, ok := t.simpleTokens[tk]; ok {
-			plog.Infof("deleting token %s for user %s", tk, username)
-			delete(t.simpleTokens, tk)
-		}
-	}
 }
 
 func (t *tokenSimple) enable() {
-	t.simpleTokenKeeper = NewSimpleTokenTTLKeeper(newDeleterFunc(t))
+	delf := func(tk string) {
+		if username, ok := t.simpleTokens[tk]; ok {
+			if t.lg != nil {
+				t.lg.Info(
+					"deleted a simple token",
+					zap.String("user-name", username),
+					zap.String("token", tk),
+				)
+			} else {
+				plog.Infof("deleting token %s for user %s", tk, username)
+			}
+			delete(t.simpleTokens, tk)
+		}
+	}
+	t.simpleTokenKeeper = &simpleTokenTTLKeeper{
+		tokens:          make(map[string]time.Time),
+		donec:           make(chan struct{}),
+		stopc:           make(chan struct{}),
+		deleteTokenFunc: delf,
+		mu:              &t.simpleTokensMu,
+	}
+	go t.simpleTokenKeeper.run()
 }
 
 func (t *tokenSimple) disable() {
-	if t.simpleTokenKeeper != nil {
-		t.simpleTokenKeeper.stop()
-		t.simpleTokenKeeper = nil
-	}
 	t.simpleTokensMu.Lock()
+	tk := t.simpleTokenKeeper
+	t.simpleTokenKeeper = nil
 	t.simpleTokens = make(map[string]string) // invalidate all tokens
 	t.simpleTokensMu.Unlock()
+	if tk != nil {
+		tk.stop()
+	}
 }
 
 func (t *tokenSimple) info(ctx context.Context, token string, revision uint64) (*AuthInfo, bool) {
 	if !t.isValidSimpleToken(ctx, token) {
 		return nil, false
 	}
-	t.simpleTokenKeeper.tokensMu.Lock()
 	t.simpleTokensMu.Lock()
 	username, ok := t.simpleTokens[token]
-	if ok {
+	if ok && t.simpleTokenKeeper != nil {
 		t.simpleTokenKeeper.resetSimpleToken(token)
 	}
 	t.simpleTokensMu.Unlock()
-	t.simpleTokenKeeper.tokensMu.Unlock()
 	return &AuthInfo{Username: username, Revision: revision}, ok
 }
 
 func (t *tokenSimple) assign(ctx context.Context, username string, rev uint64) (string, error) {
 	// rev isn't used in simple token, it is only used in JWT
-	index := ctx.Value("index").(uint64)
-	simpleToken := ctx.Value("simpleToken").(string)
-	token := fmt.Sprintf("%s.%d", simpleToken, index)
+	index := ctx.Value(AuthenticateParamIndex{}).(uint64)
+	simpleTokenPrefix := ctx.Value(AuthenticateParamSimpleTokenPrefix{}).(string)
+	token := fmt.Sprintf("%s.%d", simpleTokenPrefix, index)
 	t.assignSimpleTokenToUser(username, token)
 
 	return token, nil
@@ -223,8 +234,9 @@ func (t *tokenSimple) isValidSimpleToken(ctx context.Context, token string) bool
 	return false
 }
 
-func newTokenProviderSimple(indexWaiter func(uint64) <-chan struct{}) *tokenSimple {
+func newTokenProviderSimple(lg *zap.Logger, indexWaiter func(uint64) <-chan struct{}) *tokenSimple {
 	return &tokenSimple{
+		lg:           lg,
 		simpleTokens: make(map[string]string),
 		indexWaiter:  indexWaiter,
 	}

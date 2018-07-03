@@ -22,7 +22,7 @@ import (
 	"github.com/coreos/etcd/clientv3/clientv3util"
 )
 
-func ExampleKeyExists_put() {
+func ExampleKeyMissing() {
 	cli, err := clientv3.New(clientv3.Config{
 		Endpoints: []string{"127.0.0.1:2379"},
 	})
@@ -33,7 +33,7 @@ func ExampleKeyExists_put() {
 	kvc := clientv3.NewKV(cli)
 
 	// perform a put only if key is missing
-	// It is useful to do the check (transactionally) to avoid overwriting
+	// It is useful to do the check atomically to avoid overwriting
 	// the existing key which would generate potentially unwanted events,
 	// unless of course you wanted to do an overwrite no matter what.
 	_, err = kvc.Txn(context.Background()).
@@ -45,7 +45,7 @@ func ExampleKeyExists_put() {
 	}
 }
 
-func ExampleKeyExists_delete() {
+func ExampleKeyExists() {
 	cli, err := clientv3.New(clientv3.Config{
 		Endpoints: []string{"127.0.0.1:2379"},
 	})

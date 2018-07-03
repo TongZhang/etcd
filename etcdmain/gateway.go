@@ -21,11 +21,10 @@ import (
 	"os"
 	"time"
 
-	"github.com/coreos/etcd/client"
-	"github.com/coreos/etcd/pkg/transport"
 	"github.com/coreos/etcd/proxy/tcpproxy"
 
 	"github.com/spf13/cobra"
+	"go.uber.org/zap"
 )
 
 var (
@@ -81,63 +80,64 @@ func newGatewayStartCommand() *cobra.Command {
 
 func stripSchema(eps []string) []string {
 	var endpoints []string
-
 	for _, ep := range eps {
-
 		if u, err := url.Parse(ep); err == nil && u.Host != "" {
 			ep = u.Host
 		}
-
 		endpoints = append(endpoints, ep)
 	}
-
 	return endpoints
 }
+
 func startGateway(cmd *cobra.Command, args []string) {
-	endpoints := gatewayEndpoints
-	if gatewayDNSCluster != "" {
-		eps, err := client.NewSRVDiscover().Discover(gatewayDNSCluster)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		plog.Infof("discovered the cluster %s from %s", eps, gatewayDNSCluster)
-		// confirm TLS connections are good
-		if !gatewayInsecureDiscovery {
-			tlsInfo := transport.TLSInfo{
-				TrustedCAFile: gatewayCA,
-				ServerName:    gatewayDNSCluster,
-			}
-			plog.Infof("validating discovered endpoints %v", eps)
-			endpoints, err = transport.ValidateSecureEndpoints(tlsInfo, eps)
-			if err != nil {
-				plog.Warningf("%v", err)
-			}
-			plog.Infof("using discovered endpoints %v", endpoints)
-		}
+	var lg *zap.Logger
+	lg, err := zap.NewProduction()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
 	}
 
+	srvs := discoverEndpoints(lg, gatewayDNSCluster, gatewayCA, gatewayInsecureDiscovery)
+	if len(srvs.Endpoints) == 0 {
+		// no endpoints discovered, fall back to provided endpoints
+		srvs.Endpoints = gatewayEndpoints
+	}
 	// Strip the schema from the endpoints because we start just a TCP proxy
-	endpoints = stripSchema(endpoints)
-
-	if len(endpoints) == 0 {
-		plog.Fatalf("no endpoints found")
+	srvs.Endpoints = stripSchema(srvs.Endpoints)
+	if len(srvs.SRVs) == 0 {
+		for _, ep := range srvs.Endpoints {
+			h, p, serr := net.SplitHostPort(ep)
+			if serr != nil {
+				fmt.Printf("error parsing endpoint %q", ep)
+				os.Exit(1)
+			}
+			var port uint16
+			fmt.Sscanf(p, "%d", &port)
+			srvs.SRVs = append(srvs.SRVs, &net.SRV{Target: h, Port: port})
+		}
 	}
 
-	l, err := net.Listen("tcp", gatewayListenAddr)
+	if len(srvs.Endpoints) == 0 {
+		fmt.Println("no endpoints found")
+		os.Exit(1)
+	}
+
+	var l net.Listener
+	l, err = net.Listen("tcp", gatewayListenAddr)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 
 	tp := tcpproxy.TCPProxy{
+		Logger:          lg,
 		Listener:        l,
-		Endpoints:       endpoints,
+		Endpoints:       srvs.SRVs,
 		MonitorInterval: getewayRetryDelay,
 	}
 
 	// At this point, etcd gateway listener is initialized
-	notifySystemd()
+	notifySystemd(lg)
 
 	tp.Run()
 }

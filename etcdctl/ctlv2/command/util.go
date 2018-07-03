@@ -15,6 +15,7 @@
 package command
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -27,11 +28,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/bgentry/speakeasy"
 	"github.com/coreos/etcd/client"
 	"github.com/coreos/etcd/pkg/transport"
+
+	"github.com/bgentry/speakeasy"
 	"github.com/urfave/cli"
-	"golang.org/x/net/context"
 )
 
 var (
@@ -172,10 +173,10 @@ func getTransport(c *cli.Context) (*http.Transport, error) {
 		discoveryDomain = ""
 	}
 	tls := transport.TLSInfo{
-		CAFile:     cafile,
-		CertFile:   certfile,
-		KeyFile:    keyfile,
-		ServerName: discoveryDomain,
+		CertFile:      certfile,
+		KeyFile:       keyfile,
+		ServerName:    discoveryDomain,
+		TrustedCAFile: cafile,
 	}
 
 	dialTimeout := defaultDialTimeout

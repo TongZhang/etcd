@@ -17,6 +17,8 @@ package mvcc
 import (
 	"reflect"
 	"testing"
+
+	"go.uber.org/zap"
 )
 
 func TestKeyIndexGet(t *testing.T) {
@@ -28,7 +30,7 @@ func TestKeyIndexGet(t *testing.T) {
 	//    {{8, 0}[1], {10, 0}[2], {12, 0}(t)[3]}
 	//    {{2, 0}[1], {4, 0}[2], {6, 0}(t)[3]}
 	ki := newTestKeyIndex()
-	ki.compact(4, make(map[revision]struct{}))
+	ki.compact(zap.NewExample(), 4, make(map[revision]struct{}))
 
 	tests := []struct {
 		rev int64
@@ -68,7 +70,7 @@ func TestKeyIndexGet(t *testing.T) {
 	}
 
 	for i, tt := range tests {
-		mod, creat, ver, err := ki.get(tt.rev)
+		mod, creat, ver, err := ki.get(zap.NewExample(), tt.rev)
 		if err != tt.werr {
 			t.Errorf("#%d: err = %v, want %v", i, err, tt.werr)
 		}
@@ -86,7 +88,7 @@ func TestKeyIndexGet(t *testing.T) {
 
 func TestKeyIndexSince(t *testing.T) {
 	ki := newTestKeyIndex()
-	ki.compact(4, make(map[revision]struct{}))
+	ki.compact(zap.NewExample(), 4, make(map[revision]struct{}))
 
 	allRevs := []revision{{4, 0}, {6, 0}, {8, 0}, {10, 0}, {12, 0}, {14, 1}, {16, 0}}
 	tests := []struct {
@@ -115,7 +117,7 @@ func TestKeyIndexSince(t *testing.T) {
 	}
 
 	for i, tt := range tests {
-		revs := ki.since(tt.rev)
+		revs := ki.since(zap.NewExample(), tt.rev)
 		if !reflect.DeepEqual(revs, tt.wrevs) {
 			t.Errorf("#%d: revs = %+v, want %+v", i, revs, tt.wrevs)
 		}
@@ -124,7 +126,7 @@ func TestKeyIndexSince(t *testing.T) {
 
 func TestKeyIndexPut(t *testing.T) {
 	ki := &keyIndex{key: []byte("foo")}
-	ki.put(5, 0)
+	ki.put(zap.NewExample(), 5, 0)
 
 	wki := &keyIndex{
 		key:         []byte("foo"),
@@ -135,7 +137,7 @@ func TestKeyIndexPut(t *testing.T) {
 		t.Errorf("ki = %+v, want %+v", ki, wki)
 	}
 
-	ki.put(7, 0)
+	ki.put(zap.NewExample(), 7, 0)
 
 	wki = &keyIndex{
 		key:         []byte("foo"),
@@ -149,7 +151,7 @@ func TestKeyIndexPut(t *testing.T) {
 
 func TestKeyIndexRestore(t *testing.T) {
 	ki := &keyIndex{key: []byte("foo")}
-	ki.restore(revision{5, 0}, revision{7, 0}, 2)
+	ki.restore(zap.NewExample(), revision{5, 0}, revision{7, 0}, 2)
 
 	wki := &keyIndex{
 		key:         []byte("foo"),
@@ -163,9 +165,9 @@ func TestKeyIndexRestore(t *testing.T) {
 
 func TestKeyIndexTombstone(t *testing.T) {
 	ki := &keyIndex{key: []byte("foo")}
-	ki.put(5, 0)
+	ki.put(zap.NewExample(), 5, 0)
 
-	err := ki.tombstone(7, 0)
+	err := ki.tombstone(zap.NewExample(), 7, 0)
 	if err != nil {
 		t.Errorf("unexpected tombstone error: %v", err)
 	}
@@ -179,9 +181,9 @@ func TestKeyIndexTombstone(t *testing.T) {
 		t.Errorf("ki = %+v, want %+v", ki, wki)
 	}
 
-	ki.put(8, 0)
-	ki.put(9, 0)
-	err = ki.tombstone(15, 0)
+	ki.put(zap.NewExample(), 8, 0)
+	ki.put(zap.NewExample(), 9, 0)
+	err = ki.tombstone(zap.NewExample(), 15, 0)
 	if err != nil {
 		t.Errorf("unexpected tombstone error: %v", err)
 	}
@@ -199,13 +201,13 @@ func TestKeyIndexTombstone(t *testing.T) {
 		t.Errorf("ki = %+v, want %+v", ki, wki)
 	}
 
-	err = ki.tombstone(16, 0)
+	err = ki.tombstone(zap.NewExample(), 16, 0)
 	if err != ErrRevisionNotFound {
 		t.Errorf("tombstone error = %v, want %v", err, ErrRevisionNotFound)
 	}
 }
 
-func TestKeyIndexCompact(t *testing.T) {
+func TestKeyIndexCompactAndKeep(t *testing.T) {
 	tests := []struct {
 		compact int64
 
@@ -441,11 +443,20 @@ func TestKeyIndexCompact(t *testing.T) {
 		},
 	}
 
-	// Continuous Compaction
+	// Continuous Compaction and finding Keep
 	ki := newTestKeyIndex()
 	for i, tt := range tests {
 		am := make(map[revision]struct{})
-		ki.compact(tt.compact, am)
+		kiclone := cloneKeyIndex(ki)
+		ki.keep(tt.compact, am)
+		if !reflect.DeepEqual(ki, kiclone) {
+			t.Errorf("#%d: ki = %+v, want %+v", i, ki, kiclone)
+		}
+		if !reflect.DeepEqual(am, tt.wam) {
+			t.Errorf("#%d: am = %+v, want %+v", i, am, tt.wam)
+		}
+		am = make(map[revision]struct{})
+		ki.compact(zap.NewExample(), tt.compact, am)
 		if !reflect.DeepEqual(ki, tt.wki) {
 			t.Errorf("#%d: ki = %+v, want %+v", i, ki, tt.wki)
 		}
@@ -454,12 +465,21 @@ func TestKeyIndexCompact(t *testing.T) {
 		}
 	}
 
-	// Jump Compaction
+	// Jump Compaction and finding Keep
 	ki = newTestKeyIndex()
 	for i, tt := range tests {
 		if (i%2 == 0 && i < 6) || (i%2 == 1 && i > 6) {
 			am := make(map[revision]struct{})
-			ki.compact(tt.compact, am)
+			kiclone := cloneKeyIndex(ki)
+			ki.keep(tt.compact, am)
+			if !reflect.DeepEqual(ki, kiclone) {
+				t.Errorf("#%d: ki = %+v, want %+v", i, ki, kiclone)
+			}
+			if !reflect.DeepEqual(am, tt.wam) {
+				t.Errorf("#%d: am = %+v, want %+v", i, am, tt.wam)
+			}
+			am = make(map[revision]struct{})
+			ki.compact(zap.NewExample(), tt.compact, am)
 			if !reflect.DeepEqual(ki, tt.wki) {
 				t.Errorf("#%d: ki = %+v, want %+v", i, ki, tt.wki)
 			}
@@ -469,11 +489,20 @@ func TestKeyIndexCompact(t *testing.T) {
 		}
 	}
 
-	// Once Compaction
+	kiClone := newTestKeyIndex()
+	// Once Compaction and finding Keep
 	for i, tt := range tests {
 		ki := newTestKeyIndex()
 		am := make(map[revision]struct{})
-		ki.compact(tt.compact, am)
+		ki.keep(tt.compact, am)
+		if !reflect.DeepEqual(ki, kiClone) {
+			t.Errorf("#%d: ki = %+v, want %+v", i, ki, kiClone)
+		}
+		if !reflect.DeepEqual(am, tt.wam) {
+			t.Errorf("#%d: am = %+v, want %+v", i, am, tt.wam)
+		}
+		am = make(map[revision]struct{})
+		ki.compact(zap.NewExample(), tt.compact, am)
 		if !reflect.DeepEqual(ki, tt.wki) {
 			t.Errorf("#%d: ki = %+v, want %+v", i, ki, tt.wki)
 		}
@@ -483,13 +512,30 @@ func TestKeyIndexCompact(t *testing.T) {
 	}
 }
 
+func cloneKeyIndex(ki *keyIndex) *keyIndex {
+	generations := make([]generation, len(ki.generations))
+	for i, gen := range ki.generations {
+		generations[i] = *cloneGeneration(&gen)
+	}
+	return &keyIndex{ki.key, ki.modified, generations}
+}
+
+func cloneGeneration(g *generation) *generation {
+	if g.revs == nil {
+		return &generation{g.ver, g.created, nil}
+	}
+	tmp := make([]revision, len(g.revs))
+	copy(tmp, g.revs)
+	return &generation{g.ver, g.created, tmp}
+}
+
 // test that compact on version that higher than last modified version works well
 func TestKeyIndexCompactOnFurtherRev(t *testing.T) {
 	ki := &keyIndex{key: []byte("foo")}
-	ki.put(1, 0)
-	ki.put(2, 0)
+	ki.put(zap.NewExample(), 1, 0)
+	ki.put(zap.NewExample(), 2, 0)
 	am := make(map[revision]struct{})
-	ki.compact(3, am)
+	ki.compact(zap.NewExample(), 3, am)
 
 	wki := &keyIndex{
 		key:      []byte("foo"),
@@ -641,14 +687,14 @@ func newTestKeyIndex() *keyIndex {
 	//    {{2, 0}[1], {4, 0}[2], {6, 0}(t)[3]}
 
 	ki := &keyIndex{key: []byte("foo")}
-	ki.put(2, 0)
-	ki.put(4, 0)
-	ki.tombstone(6, 0)
-	ki.put(8, 0)
-	ki.put(10, 0)
-	ki.tombstone(12, 0)
-	ki.put(14, 0)
-	ki.put(14, 1)
-	ki.tombstone(16, 0)
+	ki.put(zap.NewExample(), 2, 0)
+	ki.put(zap.NewExample(), 4, 0)
+	ki.tombstone(zap.NewExample(), 6, 0)
+	ki.put(zap.NewExample(), 8, 0)
+	ki.put(zap.NewExample(), 10, 0)
+	ki.tombstone(zap.NewExample(), 12, 0)
+	ki.put(zap.NewExample(), 14, 0)
+	ki.put(zap.NewExample(), 14, 1)
+	ki.tombstone(zap.NewExample(), 16, 0)
 	return ki
 }

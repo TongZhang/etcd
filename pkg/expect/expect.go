@@ -33,7 +33,6 @@ type ExpectProcess struct {
 	fpty *os.File
 	wg   sync.WaitGroup
 
-	ptyMu sync.Mutex // protects accessing fpty
 	cond  *sync.Cond // for broadcasting updates are available
 	mu    sync.Mutex // protects lines and err
 	lines []string
@@ -43,8 +42,6 @@ type ExpectProcess struct {
 	// StopSignal is the signal Stop sends to the process; defaults to SIGKILL.
 	StopSignal os.Signal
 }
-
-var printDebugLines = os.Getenv("EXPECT_DEBUG") != ""
 
 // NewExpect creates a new process for expect testing.
 func NewExpect(name string, arg ...string) (ep *ExpectProcess, err error) {
@@ -75,11 +72,10 @@ func NewExpectWithEnv(name string, args []string, env []string) (ep *ExpectProce
 
 func (ep *ExpectProcess) read() {
 	defer ep.wg.Done()
+	printDebugLines := os.Getenv("EXPECT_DEBUG") != ""
 	r := bufio.NewReader(ep.fpty)
 	for ep.err == nil {
-		ep.ptyMu.Lock()
 		l, rerr := r.ReadString('\n')
-		ep.ptyMu.Unlock()
 		ep.mu.Lock()
 		ep.err = rerr
 		if l != "" {
@@ -151,9 +147,7 @@ func (ep *ExpectProcess) close(kill bool) error {
 	}
 
 	err := ep.cmd.Wait()
-	ep.ptyMu.Lock()
 	ep.fpty.Close()
-	ep.ptyMu.Unlock()
 	ep.wg.Wait()
 
 	if err != nil {

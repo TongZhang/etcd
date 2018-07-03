@@ -15,17 +15,15 @@
 package leasehttp
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/coreos/etcd/lease"
 	"github.com/coreos/etcd/mvcc/backend"
-
-	"golang.org/x/net/context"
 )
 
 func TestRenewHTTP(t *testing.T) {
@@ -111,7 +109,7 @@ func testApplyTimeout(t *testing.T, f func(*lease.Lease, string) error) {
 	if err == nil {
 		t.Fatalf("expected timeout error, got nil")
 	}
-	if strings.Compare(err.Error(), ErrLeaseHTTPTimeout.Error()) != 0 {
+	if err.Error() != ErrLeaseHTTPTimeout.Error() {
 		t.Fatalf("expected (%v), got (%v)", ErrLeaseHTTPTimeout.Error(), err.Error())
 	}
 }

@@ -18,6 +18,7 @@ import (
 	"fmt"
 
 	v3 "github.com/coreos/etcd/clientv3"
+	"github.com/coreos/etcd/clientv3/snapshot"
 	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
 	spb "github.com/coreos/etcd/mvcc/mvccpb"
 )
@@ -30,7 +31,7 @@ func (p *fieldsPrinter) kv(pfx string, kv *spb.KeyValue) {
 	fmt.Printf("\"%sModRevision\" : %d\n", pfx, kv.ModRevision)
 	fmt.Printf("\"%sVersion\" : %d\n", pfx, kv.Version)
 	fmt.Printf("\"%sValue\" : %q\n", pfx, string(kv.Value))
-	fmt.Printf("\"%sLease\" : %d\n", pfx, string(kv.Lease))
+	fmt.Printf("\"%sLease\" : %d\n", pfx, kv.Lease)
 }
 
 func (p *fieldsPrinter) hdr(h *pb.ResponseHeader) {
@@ -92,6 +93,22 @@ func (p *fieldsPrinter) Watch(resp v3.WatchResponse) {
 	}
 }
 
+func (p *fieldsPrinter) Grant(r v3.LeaseGrantResponse) {
+	p.hdr(r.ResponseHeader)
+	fmt.Println(`"ID" :`, r.ID)
+	fmt.Println(`"TTL" :`, r.TTL)
+}
+
+func (p *fieldsPrinter) Revoke(id v3.LeaseID, r v3.LeaseRevokeResponse) {
+	p.hdr(r.Header)
+}
+
+func (p *fieldsPrinter) KeepAlive(r v3.LeaseKeepAliveResponse) {
+	p.hdr(r.ResponseHeader)
+	fmt.Println(`"ID" :`, r.ID)
+	fmt.Println(`"TTL" :`, r.TTL)
+}
+
 func (p *fieldsPrinter) TimeToLive(r v3.LeaseTimeToLiveResponse, keys bool) {
 	p.hdr(r.ResponseHeader)
 	fmt.Println(`"ID" :`, r.ID)
@@ -99,6 +116,13 @@ func (p *fieldsPrinter) TimeToLive(r v3.LeaseTimeToLiveResponse, keys bool) {
 	fmt.Println(`"GrantedTTL" :`, r.GrantedTTL)
 	for _, k := range r.Keys {
 		fmt.Printf("\"Key\" : %q\n", string(k))
+	}
+}
+
+func (p *fieldsPrinter) Leases(r v3.LeaseLeasesResponse) {
+	p.hdr(r.ResponseHeader)
+	for _, item := range r.Leases {
+		fmt.Println(`"ID" :`, item.ID)
 	}
 }
 
@@ -117,15 +141,36 @@ func (p *fieldsPrinter) MemberList(r v3.MemberListResponse) {
 	}
 }
 
+func (p *fieldsPrinter) EndpointHealth(hs []epHealth) {
+	for _, h := range hs {
+		fmt.Printf("\"Endpoint\" : %q\n", h.Ep)
+		fmt.Println(`"Health" :`, h.Health)
+		fmt.Println(`"Took" :`, h.Took)
+		fmt.Println(`"Error" :`, h.Error)
+		fmt.Println()
+	}
+}
+
 func (p *fieldsPrinter) EndpointStatus(eps []epStatus) {
 	for _, ep := range eps {
 		p.hdr(ep.Resp.Header)
 		fmt.Printf("\"Version\" : %q\n", ep.Resp.Version)
-		fmt.Println(`"DBSize" :"`, ep.Resp.DbSize)
-		fmt.Println(`"Leader" :"`, ep.Resp.Leader)
-		fmt.Println(`"RaftIndex" :"`, ep.Resp.RaftIndex)
-		fmt.Println(`"RaftTerm" :"`, ep.Resp.RaftTerm)
+		fmt.Println(`"DBSize" :`, ep.Resp.DbSize)
+		fmt.Println(`"Leader" :`, ep.Resp.Leader)
+		fmt.Println(`"RaftIndex" :`, ep.Resp.RaftIndex)
+		fmt.Println(`"RaftTerm" :`, ep.Resp.RaftTerm)
+		fmt.Println(`"RaftAppliedIndex" :`, ep.Resp.RaftAppliedIndex)
+		fmt.Println(`"Errors" :`, ep.Resp.Errors)
 		fmt.Printf("\"Endpoint\" : %q\n", ep.Ep)
+		fmt.Println()
+	}
+}
+
+func (p *fieldsPrinter) EndpointHashKV(hs []epHashKV) {
+	for _, h := range hs {
+		p.hdr(h.Resp.Header)
+		fmt.Printf("\"Endpoint\" : %q\n", h.Ep)
+		fmt.Println(`"Hash" :`, h.Resp.Hash)
 		fmt.Println()
 	}
 }
@@ -139,17 +184,31 @@ func (p *fieldsPrinter) Alarm(r v3.AlarmResponse) {
 	}
 }
 
-func (p *fieldsPrinter) DBStatus(r dbstatus) {
+func (p *fieldsPrinter) DBStatus(r snapshot.Status) {
 	fmt.Println(`"Hash" :`, r.Hash)
 	fmt.Println(`"Revision" :`, r.Revision)
 	fmt.Println(`"Keys" :`, r.TotalKey)
 	fmt.Println(`"Size" :`, r.TotalSize)
 }
 
-func (p *fieldsPrinter) RoleAdd(role string, r v3.AuthRoleAddResponse)       { p.hdr(r.Header) }
-func (p *fieldsPrinter) RoleGet(role string, r v3.AuthRoleGetResponse)       { p.hdr(r.Header) }
+func (p *fieldsPrinter) RoleAdd(role string, r v3.AuthRoleAddResponse) { p.hdr(r.Header) }
+func (p *fieldsPrinter) RoleGet(role string, r v3.AuthRoleGetResponse) {
+	p.hdr(r.Header)
+	for _, p := range r.Perm {
+		fmt.Println(`"PermType" : `, p.PermType.String())
+		fmt.Printf("\"Key\" : %q\n", string(p.Key))
+		fmt.Printf("\"RangeEnd\" : %q\n", string(p.RangeEnd))
+	}
+}
 func (p *fieldsPrinter) RoleDelete(role string, r v3.AuthRoleDeleteResponse) { p.hdr(r.Header) }
-func (p *fieldsPrinter) RoleList(r v3.AuthRoleListResponse)                  { p.hdr(r.Header) }
+func (p *fieldsPrinter) RoleList(r v3.AuthRoleListResponse) {
+	p.hdr(r.Header)
+	fmt.Printf(`"Roles" :`)
+	for _, r := range r.Roles {
+		fmt.Printf(" %q", r)
+	}
+	fmt.Println()
+}
 func (p *fieldsPrinter) RoleGrantPermission(role string, r v3.AuthRoleGrantPermissionResponse) {
 	p.hdr(r.Header)
 }

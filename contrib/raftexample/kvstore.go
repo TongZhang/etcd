@@ -21,7 +21,7 @@ import (
 	"log"
 	"sync"
 
-	"github.com/coreos/etcd/snap"
+	"github.com/coreos/etcd/etcdserver/api/snap"
 )
 
 // a key-value store backed by raft
@@ -58,7 +58,7 @@ func (s *kvstore) Propose(k string, v string) {
 	if err := gob.NewEncoder(&buf).Encode(kv{k, v}); err != nil {
 		log.Fatal(err)
 	}
-	s.proposeC <- string(buf.Bytes())
+	s.proposeC <- buf.String()
 }
 
 func (s *kvstore) readCommits(commitC <-chan *string, errorC <-chan error) {
@@ -70,7 +70,7 @@ func (s *kvstore) readCommits(commitC <-chan *string, errorC <-chan error) {
 			if err == snap.ErrNoSnapshot {
 				return
 			}
-			if err != nil && err != snap.ErrNoSnapshot {
+			if err != nil {
 				log.Panic(err)
 			}
 			log.Printf("loading snapshot at term %d and index %d", snapshot.Metadata.Term, snapshot.Metadata.Index)

@@ -21,7 +21,7 @@ An etcd operation is considered complete when it is committed through consensus,
 
 #### Revision
 
-An etcd operation that modifies the key value store is assigned with a single increasing revision. A transaction operation might modifies the key value store multiple times, but only one revision is assigned. The revision attribute of a key value pair that modified by the operation has the same value as the revision of the operation. The revision can be used as a logical clock for key value store. A key value pair that has a larger revision is modified after a key value pair with a smaller revision. Two key value pairs that have the same revision are modified by an operation "concurrently".
+An etcd operation that modifies the key value store is assigned a single increasing revision. A transaction operation might modify the key value store multiple times, but only one revision is assigned. The revision attribute of a key value pair that was modified by the operation has the same value as the revision of the operation. The revision can be used as a logical clock for key value store. A key value pair that has a larger revision is modified after a key value pair with a smaller revision. Two key value pairs that have the same revision are modified by an operation "concurrently".
 
 ### Guarantees provided
 
@@ -51,7 +51,7 @@ Linearizability (also known as Atomic Consistency or External Consistency) is a 
 
 For linearizability, suppose each operation receives a timestamp from a loosely synchronized global clock. Operations are linearized if and only if they always complete as though they were executed in a sequential order and each operation appears to complete in the order specified by the program. Likewise, if an operation’s timestamp precedes another, that operation must also precede the other operation in the sequence.
 
-For example, consider a client completing a write at time point 1 (*t1*). A client issuing a read at *t2* (for *t2* > *t1*) should receive a value at least as recent as the previous write, completed at *t1*. However, the read might actually complete only by *t3*, and the returned value, current at *t2* when the read began, might be "stale" by *t3*.
+For example, consider a client completing a write at time point 1 (*t1*). A client issuing a read at *t2* (for *t2* > *t1*) should receive a value at least as recent as the previous write, completed at *t1*. However, the read might actually complete only by *t3*. Linearizability guarantees the read returns the most current value. Without linearizability guarantee, the returned value, current at *t2* when the read began, might be "stale" by *t3* because a concurrent write might happen between *t2* and *t3*.
 
 etcd does not ensure linearizability for watch operations. Users are expected to verify the revision of watch responses to ensure correct ordering.
 

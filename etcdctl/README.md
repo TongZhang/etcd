@@ -83,7 +83,7 @@ Insert '--' for workaround:
 
 ### GET [options] \<key\> [range_end]
 
-GET gets the key or a range of keys [key, range_end) if `range-end` is given.
+GET gets the key or a range of keys [key, range_end) if range_end is given.
 
 RPC: Range
 
@@ -115,6 +115,8 @@ RPC: Range
 
 #### Examples
 
+First, populate etcd with some keys:
+
 ```bash
 ./etcdctl put foo bar
 # OK
@@ -124,9 +126,33 @@ RPC: Range
 # OK
 ./etcdctl put foo3 bar3
 # OK
+```
+
+Get the key named `foo`:
+
+```bash
 ./etcdctl get foo
 # foo
 # bar
+```
+
+Get all keys:
+
+```bash
+./etcdctl get --from-key ''
+# foo
+# bar
+# foo1
+# bar1
+# foo2
+# foo2
+# foo3
+# bar3
+```
+
+Get all keys with names greater than or equal to `foo1`:
+
+```bash
 ./etcdctl get --from-key foo1
 # foo1
 # bar1
@@ -134,6 +160,11 @@ RPC: Range
 # bar2
 # foo3
 # bar3
+```
+
+Get keys with names greater than or equal to `foo1` and less than `foo3`:
+
+```bash
 ./etcdctl get foo1 foo3
 # foo1
 # bar1
@@ -147,7 +178,7 @@ If any key or value contains non-printable characters or control characters, sim
 
 ### DEL [options] \<key\> [range_end]
 
-Removes the specified key or range of keys [key, range_end) if `range-end` is given.
+Removes the specified key or range of keys [key, range_end) if range_end is given.
 
 RPC: DeleteRange
 
@@ -223,12 +254,13 @@ RPC: Txn
 #### Input Format
 ```ebnf
 <Txn> ::= <CMP>* "\n" <THEN> "\n" <ELSE> "\n"
-<CMP> ::= (<CMPCREATE>|<CMPMOD>|<CMPVAL>|<CMPVER>) "\n"
+<CMP> ::= (<CMPCREATE>|<CMPMOD>|<CMPVAL>|<CMPVER>|<CMPLEASE>) "\n"
 <CMPOP> ::= "<" | "=" | ">"
-<CMPCREATE> := ("c"|"create")"("<KEY>")" <REVISION>
+<CMPCREATE> := ("c"|"create")"("<KEY>")" <CMPOP> <REVISION>
 <CMPMOD> ::= ("m"|"mod")"("<KEY>")" <CMPOP> <REVISION>
 <CMPVAL> ::= ("val"|"value")"("<KEY>")" <CMPOP> <VALUE>
 <CMPVER> ::= ("ver"|"version")"("<KEY>")" <CMPOP> <VERSION>
+<CMPLEASE> ::= "lease("<KEY>")" <CMPOP> <LEASE>
 <THEN> ::= <OP>*
 <ELSE> ::= <OP>*
 <OP> ::= ((see put, get, del etcdctl command syntax)) "\n"
@@ -236,6 +268,7 @@ RPC: Txn
 <VALUE> ::= (%q formatted string)
 <REVISION> ::= "\""[0-9]+"\""
 <VERSION> ::= "\""[0-9]+"\""
+<LEASE> ::= "\""[0-9]+\""
 ```
 
 #### Output
@@ -304,9 +337,9 @@ Prints the compacted revision.
 # compacted revision 1234
 ```
 
-### WATCH [options] [key or prefix] [range_end]
+### WATCH [options] [key or prefix] [range_end] [--] [exec-command arg1 arg2 ...]
 
-Watch watches events stream on keys or prefixes, [key or prefix, range_end) if `range-end` is given. The watch command runs until it encounters an error or is terminated by the user.  If range_end is given, it must be lexicographically greater than key or "\x00".
+Watch watches events stream on keys or prefixes, [key or prefix, range_end) if range_end is given. The watch command runs until it encounters an error or is terminated by the user.  If range_end is given, it must be lexicographically greater than key or "\x00".
 
 RPC: Watch
 
@@ -345,6 +378,58 @@ watch [options] <key or prefix>\n
 # bar
 ```
 
+```bash
+ETCDCTL_WATCH_KEY=foo ./etcdctl watch
+# PUT
+# foo
+# bar
+```
+
+Receive events and execute `echo watch event received`:
+
+```bash
+./etcdctl watch foo -- echo watch event received
+# PUT
+# foo
+# bar
+# watch event received
+```
+
+Watch response is set via `ETCD_WATCH_*` environmental variables:
+
+```bash
+./etcdctl watch foo -- sh -c "env | grep ETCD_WATCH_"
+
+# PUT
+# foo
+# bar
+# ETCD_WATCH_REVISION=11
+# ETCD_WATCH_KEY="foo"
+# ETCD_WATCH_EVENT_TYPE="PUT"
+# ETCD_WATCH_VALUE="bar"
+```
+
+Watch with environmental variables and execute `echo watch event received`:
+
+```bash
+export ETCDCTL_WATCH_KEY=foo
+./etcdctl watch -- echo watch event received
+# PUT
+# foo
+# bar
+# watch event received
+```
+
+```bash
+export ETCDCTL_WATCH_KEY=foo
+export ETCDCTL_WATCH_RANGE_END=foox
+./etcdctl watch -- echo watch event received
+# PUT
+# fob
+# bar
+# watch event received
+```
+
 ##### Interactive
 
 ```bash
@@ -357,6 +442,40 @@ watch foo
 # PUT
 # foo
 # bar
+```
+
+Receive events and execute `echo watch event received`:
+
+```bash
+./etcdctl watch -i
+watch foo -- echo watch event received
+# PUT
+# foo
+# bar
+# watch event received
+```
+
+Watch with environmental variables and execute `echo watch event received`:
+
+```bash
+export ETCDCTL_WATCH_KEY=foo
+./etcdctl watch -i
+watch -- echo watch event received
+# PUT
+# foo
+# bar
+# watch event received
+```
+
+```bash
+export ETCDCTL_WATCH_KEY=foo
+export ETCDCTL_WATCH_RANGE_END=foox
+./etcdctl watch -i
+watch -- echo watch event received
+# PUT
+# fob
+# bar
+# watch event received
 ```
 
 ### LEASE \<subcommand\>
@@ -435,6 +554,29 @@ Prints lease information.
 
 ./etcdctl lease timetolive 2d8257079fa1bc0c --write-out=json --keys
 # {"cluster_id":17186838941855831277,"member_id":4845372305070271874,"revision":3,"raft_term":2,"id":3279279168933706764,"ttl":459,"granted-ttl":500,"keys":["Zm9vMQ==","Zm9vMg=="]}
+
+./etcdctl lease timetolive 2d8257079fa1bc0c
+# lease 2d8257079fa1bc0c already expired
+```
+
+### LEASE LIST
+
+LEASE LIST lists all active leases.
+
+RPC: LeaseLeases
+
+#### Output
+
+Prints a message with a list of active leases.
+
+#### Example
+
+```bash
+./etcdctl lease grant 10
+# lease 32695410dcc0ca06 granted with TTL(10s)
+
+./etcdctl lease list
+32695410dcc0ca06
 ```
 
 ### LEASE KEEP-ALIVE \<leaseID\>
@@ -565,6 +707,10 @@ Prints a humanized table of the member IDs, statuses, names, peer addresses, and
 
 ENDPOINT provides commands for querying individual endpoints.
 
+#### Options
+
+- cluster -- fetch and use all endpoints from the etcd cluster member list
+
 ### ENDPOINT HEALTH
 
 ENDPOINT HEALTH checks the health of the list of endpoints with respect to cluster. An endpoint is unhealthy
@@ -576,11 +722,20 @@ If an endpoint can participate in consensus, prints a message indicating the end
 
 #### Example
 
+Check the default endpoint's health:
+
 ```bash
 ./etcdctl endpoint health
-# 127.0.0.1:32379 is healthy: successfully committed proposal: took = 2.130877ms
 # 127.0.0.1:2379 is healthy: successfully committed proposal: took = 2.095242ms
-# 127.0.0.1:22379 is healthy: successfully committed proposal: took = 2.083263ms
+```
+
+Check all endpoints for the cluster associated with the default endpoint:
+
+```bash
+./etcdctl endpoint --cluster health
+# http://127.0.0.1:2379 is healthy: successfully committed proposal: took = 1.060091ms
+# http://127.0.0.1:22379 is healthy: successfully committed proposal: took = 903.138µs
+# http://127.0.0.1:32379 is healthy: successfully committed proposal: took = 1.113848ms
 ```
 
 ### ENDPOINT STATUS
@@ -599,27 +754,74 @@ Prints a line of JSON encoding each endpoint URL, ID, version, database size, le
 
 #### Examples
 
+Get the status for the default endpoint:
+
 ```bash
 ./etcdctl endpoint status
 # 127.0.0.1:2379, 8211f1d0f64f3269, 3.0.0, 25 kB, false, 2, 63
-# 127.0.0.1:22379, 91bc3c398fb3c146, 3.0.0, 25 kB, false, 2, 63
-# 127.0.0.1:32379, fd422379fda50e48, 3.0.0, 25 kB, true, 2, 63
 ```
+
+Get the status for the default endpoint as JSON:
 
 ```bash
 ./etcdctl -w json endpoint status
-# [{"Endpoint":"127.0.0.1:2379","Status":{"header":{"cluster_id":17237436991929493444,"member_id":9372538179322589801,"revision":2,"raft_term":2},"version":"3.0.0","dbSize":24576,"leader":18249187646912138824,"raftIndex":32623,"raftTerm":2}},{"Endpoint":"127.0.0.1:22379","Status":{"header":{"cluster_id":17237436991929493444,"member_id":10501334649042878790,"revision":2,"raft_term":2},"version":"3.0.0","dbSize":24576,"leader":18249187646912138824,"raftIndex":32623,"raftTerm":2}},{"Endpoint":"127.0.0.1:32379","Status":{"header":{"cluster_id":17237436991929493444,"member_id":18249187646912138824,"revision":2,"raft_term":2},"version":"3.0.0","dbSize":24576,"leader":18249187646912138824,"raftIndex":32623,"raftTerm":2}}]
+# [{"Endpoint":"127.0.0.1:2379","Status":{"header":{"cluster_id":17237436991929493444,"member_id":9372538179322589801,"revision":2,"raft_term":2},"version":"3.0.0","dbSize":24576,"leader":18249187646912138824,"raftIndex":32623,"raftTerm":2}}]
 ```
 
+Get the status for all endpoints in the cluster associated with the default endpoint:
+
 ```bash
-./etcdctl -w table endpoint status
-+-----------------+------------------+---------+---------+-----------+-----------+------------+
-|    ENDPOINT     |        ID        | VERSION | DB SIZE | IS LEADER | RAFT TERM | RAFT INDEX |
-+-----------------+------------------+---------+---------+-----------+-----------+------------+
-| 127.0.0.1:2379  | 8211f1d0f64f3269 |  3.0.0  | 25 kB   | false     |         2 |         52 |
-| 127.0.0.1:22379 | 91bc3c398fb3c146 |  3.0.0  | 25 kB   | false     |         2 |         52 |
-| 127.0.0.1:32379 | fd422379fda50e48 |  3.0.0  | 25 kB   | true      |         2 |         52 |
-+-----------------+------------------+---------+---------+-----------+-----------+------------+
+./etcdctl -w table endpoint --cluster status
++------------------------+------------------+----------------+---------+-----------+-----------+------------+
+|        ENDPOINT        |        ID        |    VERSION     | DB SIZE | IS LEADER | RAFT TERM | RAFT INDEX |
++------------------------+------------------+----------------+---------+-----------+-----------+------------+
+| http://127.0.0.1:2379  | 8211f1d0f64f3269 | 3.2.0-rc.1+git |   25 kB |     false |         2 |          8 |
+| http://127.0.0.1:22379 | 91bc3c398fb3c146 | 3.2.0-rc.1+git |   25 kB |     false |         2 |          8 |
+| http://127.0.0.1:32379 | fd422379fda50e48 | 3.2.0-rc.1+git |   25 kB |      true |         2 |          8 |
++------------------------+------------------+----------------+---------+-----------+-----------+------------+
+```
+
+### ENDPOINT HASHKV
+
+ENDPOINT HASHKV fetches the hash of the key-value store of an endpoint.
+
+#### Output
+
+##### Simple format
+
+Prints a humanized table of each endpoint URL and KV history hash.
+
+##### JSON format
+
+Prints a line of JSON encoding each endpoint URL and KV history hash.
+
+#### Examples
+
+Get the hash for the default endpoint:
+
+```bash
+./etcdctl endpoint hashkv
+# 127.0.0.1:2379, 1084519789
+```
+
+Get the status for the default endpoint as JSON:
+
+```bash
+./etcdctl -w json endpoint hashkv
+# [{"Endpoint":"127.0.0.1:2379","Hash":{"header":{"cluster_id":14841639068965178418,"member_id":10276657743932975437,"revision":1,"raft_term":3},"hash":1084519789,"compact_revision":-1}}]
+```
+
+Get the status for all endpoints in the cluster associated with the default endpoint:
+
+```bash
+./etcdctl -w table endpoint --cluster hashkv
++------------------------+------------+
+|        ENDPOINT        |    HASH    |
++------------------------+------------+
+| http://127.0.0.1:2379  | 1084519789 |
+| http://127.0.0.1:22379 | 1084519789 |
+| http://127.0.0.1:32379 | 1084519789 |
++------------------------+------------+
 ```
 
 ### ALARM \<subcommand\>
@@ -672,11 +874,17 @@ If NOSPACE alarm is present:
 # alarm:NOSPACE
 ```
 
-### DEFRAG
+### DEFRAG [options]
 
-DEFRAG defragments the backend database file for a set of given endpoints. When an etcd member reclaims storage space
-from deleted and compacted keys, the space is kept in a free list and the database file remains the same size. By defragmenting
-the database, the etcd member releases this free space back to the file system.
+DEFRAG defragments the backend database file for a set of given endpoints while etcd is running, or directly defragments an etcd data directory while etcd is not running. When an etcd member reclaims storage space from deleted and compacted keys, the space is kept in a free list and the database file remains the same size. By defragmenting the database, the etcd member releases this free space back to the file system.
+
+**Note that defragmentation to a live member blocks the system from reading and writing data while rebuilding its states.**
+
+**Note that defragmentation request does not get replicated over cluster. That is, the request is only applied to the local node. Specify all members in `--endpoints` flag or `--cluster` flag to automatically find all cluster members.**
+
+#### Options
+
+- data-dir -- Optional. If present, defragments a data directory not in use by etcd.
 
 #### Output
 
@@ -688,6 +896,24 @@ For each endpoints, prints a message indicating whether the endpoint was success
 ./etcdctl --endpoints=localhost:2379,badendpoint:2379 defrag
 # Finished defragmenting etcd member[localhost:2379]
 # Failed to defragment etcd member[badendpoint:2379] (grpc: timed out trying to connect)
+```
+
+Run defragment operations for all endpoints in the cluster associated with the default endpoint:
+
+```bash
+./etcdctl defrag --cluster
+Finished defragmenting etcd member[http://127.0.0.1:2379]
+Finished defragmenting etcd member[http://127.0.0.1:22379]
+Finished defragmenting etcd member[http://127.0.0.1:32379]
+```
+
+To defragment a data directory directly, use the `--data-dir` flag:
+
+``` bash
+# Defragment while etcd is not running
+./etcdctl defrag --data-dir default.etcd
+# success (exit status 0)
+# Error: cannot open database at default.etcd/member/snap/db
 ```
 
 #### Remarks
@@ -722,6 +948,8 @@ SNAPSHOT RESTORE creates an etcd data directory for an etcd cluster member from 
 The snapshot restore options closely resemble to those used in the `etcd` command for defining a cluster.
 
 - data-dir -- Path to the data directory. Uses \<name\>.etcd if none given.
+
+- wal-dir -- Path to the WAL directory. Uses data directory if none given.
 
 - initial-cluster -- The initial cluster configuration for the restored etcd cluster.
 
@@ -788,21 +1016,59 @@ Prints a line of JSON encoding the database hash, revision, total keys, and size
 +----------+----------+------------+------------+
 ```
 
+### MOVE-LEADER \<hexadecimal-transferee-id\>
+
+MOVE-LEADER transfers leadership from the leader to another member in the cluster.
+
+#### Example
+
+```bash
+# to choose transferee
+transferee_id=$(./etcdctl \
+  --endpoints localhost:2379,localhost:22379,localhost:32379 \
+  endpoint status | grep -m 1 "false" | awk -F', ' '{print $2}')
+echo ${transferee_id}
+# c89feb932daef420
+
+# endpoints should include leader node
+./etcdctl --endpoints ${transferee_ep} move-leader ${transferee_id}
+# Error:  no leader endpoint given at [localhost:22379 localhost:32379]
+
+# request to leader with target node ID
+./etcdctl --endpoints ${leader_ep} move-leader ${transferee_id}
+# Leadership transferred from 45ddc0e800e20b93 to c89feb932daef420
+```
+
 ## Concurrency commands
 
-### LOCK \<lockname\>
+### LOCK [options] \<lockname\> [command arg1 arg2 ...]
 
 LOCK acquires a distributed named mutex with a given name. Once the lock is acquired, it will be held until etcdctl is terminated.
+
+#### Options
+
+- ttl - time out in seconds of lock session.
 
 #### Output
 
 Once the lock is acquired, the result for the GET on the unique lock holder key is displayed.
 
+If a command is given, it will be launched with environment variables `ETCD_LOCK_KEY` and `ETCD_LOCK_REV` set to the lock's holder key and revision.
+
 #### Example
+
+Acquire lock with standard output display:
 
 ```bash
 ./etcdctl lock mylock
 # mylock/1234534535445
+```
+
+Acquire lock and execute `echo lock acquired`:
+
+```bash
+./etcdctl lock mylock echo lock acquired
+# lock acquired
 ```
 
 #### Remarks
@@ -877,7 +1143,7 @@ RPC: AuthEnable/AuthDisable
 
 ### ROLE \<subcommand\>
 
-ROLE is used to specify differnt roles which can be assigned to etcd user(s).
+ROLE is used to specify different roles which can be assigned to etcd user(s).
 
 ### ROLE ADD \<role name\>
 
@@ -961,16 +1227,27 @@ RPC: RoleGrantPermission
 
 #### Options
 
+- from-key -- grant a permission of keys that are greater than or equal to the given key using byte compare
+
 - prefix -- grant a prefix permission
 
-#### Ouptut
+#### Output
 
-`Role <role name> updated`. 
+`Role <role name> updated`.
 
 #### Examples
 
+Grant read and write permission on the key `foo` to role `myrole`:
+
 ```bash
 ./etcdctl --user=root:123 role grant-permission myrole readwrite foo
+# Role myrole updated
+```
+
+Grant read permission on the wildcard key pattern `foo/*` to role `myrole`:
+
+```bash
+./etcdctl --user=root:123 role grant-permission --prefix myrole readwrite foo/
 # Role myrole updated
 ```
 
@@ -979,6 +1256,12 @@ RPC: RoleGrantPermission
 `role revoke-permission` revokes a key from a role.
 
 RPC: RoleRevokePermission
+
+#### Options
+
+- from-key -- revoke a permission of keys that are greater than or equal to the given key using byte compare
+
+- prefix -- revoke a prefix permission
 
 #### Output
 
@@ -1232,6 +1515,81 @@ Prints etcd version and API version.
 ./etcdctl version
 # etcdctl version: 3.1.0-alpha.0+git
 # API version: 3.1
+```
+
+### CHECK \<subcommand\>
+
+CHECK provides commands for checking properties of the etcd cluster.
+
+### CHECK PERF [options]
+
+CHECK PERF checks the performance of the etcd cluster for 60 seconds. Running the `check perf` often can create a large keyspace history which can be auto compacted and defragmented using the `--auto-compact` and `--auto-defrag` options as described below.
+
+RPC: CheckPerf
+
+#### Options
+
+- load -- the performance check's workload model. Accepted workloads: s(small), m(medium), l(large), xl(xLarge)
+
+- prefix -- the prefix for writing the performance check's keys.
+
+- auto-compact -- if true, compact storage with last revision after test is finished.
+
+- auto-defrag -- if true, defragment storage after test is finished.
+
+#### Output
+
+Prints the result of performance check on different criteria like throughput. Also prints an overall status of the check as pass or fail.
+
+#### Examples
+
+Shows examples of both, pass and fail, status. The failure is due to the fact that a large workload was tried on a single node etcd cluster running on a laptop environment created for development and testing purpose.
+
+```bash
+./etcdctl check perf --load="s"
+# 60 / 60 Booooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo! 100.00%1m0s
+# PASS: Throughput is 150 writes/s
+# PASS: Slowest request took 0.087509s
+# PASS: Stddev is 0.011084s
+# PASS
+./etcdctl check perf --load="l"
+# 60 / 60 Booooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo! 100.00%1m0s
+# FAIL: Throughput too low: 6808 writes/s
+# PASS: Slowest request took 0.228191s
+# PASS: Stddev is 0.033547s
+# FAIL
+```
+
+### CHECK DATASCALE [options]
+
+CHECK DATASCALE checks the memory usage of holding data for different workloads on a given server endpoint. Running the `check datascale` often can create a large keyspace history which can be auto compacted and defragmented using the `--auto-compact` and `--auto-defrag` options as described below.
+
+RPC: CheckDatascale
+
+#### Options
+
+- load -- the datascale check's workload model. Accepted workloads: s(small), m(medium), l(large), xl(xLarge)
+
+- prefix -- the prefix for writing the datascale check's keys.
+
+- auto-compact -- if true, compact storage with last revision after test is finished.
+
+- auto-defrag -- if true, defragment storage after test is finished.
+
+#### Output
+
+Prints the system memory usage for a given workload. Also prints status of compact and defragment if related options are passed.
+
+#### Examples
+
+```bash
+./etcdctl check datascale --load="s" --auto-compact=true --auto-defrag=true
+# Start data scale check for work load [10000 key-value pairs, 1024 bytes per key-value, 50 concurrent clients].
+# Compacting with revision 18346204
+# Compacted with revision 18346204
+# Defragmenting "127.0.0.1:2379"
+# Defragmented "127.0.0.1:2379"
+# PASS: Approximate system memory used : 64.30 MB.
 ```
 
 ## Exit codes

@@ -15,14 +15,13 @@
 package grpcproxy
 
 import (
+	"context"
 	"math"
 	"sync"
 
-	"golang.org/x/net/context"
-	"golang.org/x/time/rate"
-	"google.golang.org/grpc"
-
 	"github.com/coreos/etcd/clientv3"
+
+	"golang.org/x/time/rate"
 )
 
 const (
@@ -68,7 +67,7 @@ func (l *leader) recvLoop() {
 		}
 		if cresp.Err() != nil {
 			l.loseLeader()
-			if grpc.ErrorDesc(cresp.Err()) == grpc.ErrClientConnClosing.Error() {
+			if clientv3.IsConnCanceled(cresp.Err()) {
 				close(l.disconnc)
 				return
 			}

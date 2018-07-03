@@ -8,9 +8,11 @@ Before [starting an upgrade](#upgrade-procedure), read through the rest of this 
 
 ### Upgrade checklists
 
+**NOTE:** When [migrating from v2 with no v3 data](https://github.com/coreos/etcd/issues/9480), etcd server v3.2+ panics when etcd restores from existing snapshots but no v3 `ETCD_DATA_DIR/member/snap/db` file. This happens when the server had migrated from v2 with no previous v3 data. This also prevents accidental v3 data loss (e.g. `db` file might have been moved). etcd requires that post v3 migration can only happen with v3 data. Do not upgrade to newer v3 versions until v3.0 server contains v3 data.
+
 #### Upgrade requirements
 
-To upgrade an existing etcd deployment to 3.0, the running cluster must be 2.3 or greater. If it's before 2.3, please upgrade to [2.3](https://github.com/coreos/etcd/releases/tag/v2.3.0) before upgrading to 3.0.
+To upgrade an existing etcd deployment to 3.0, the running cluster must be 2.3 or greater. If it's before 2.3, please upgrade to [2.3](https://github.com/coreos/etcd/releases/tag/v2.3.8) before upgrading to 3.0.
 
 Also, to ensure a smooth rolling upgrade, the running cluster must be healthy. Check the health of the cluster by using the `etcdctl cluster-health` command before proceeding.
 
@@ -52,7 +54,7 @@ member 8211f1d0f64f3269 is healthy: got healthy result from http://localhost:123
 cluster is healthy
 
 $ curl http://localhost:2379/version
-{"etcdserver":"2.3.x","etcdcluster":"2.3.0"}
+{"etcdserver":"2.3.x","etcdcluster":"2.3.8"}
 ```
 
 #### 2. Stop the existing etcd process

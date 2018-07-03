@@ -15,32 +15,36 @@
 package lease
 
 import (
+	"container/heap"
 	"encoding/binary"
 	"errors"
 	"math"
 	"sort"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/coreos/etcd/lease/leasepb"
 	"github.com/coreos/etcd/mvcc/backend"
-	"github.com/coreos/etcd/pkg/monotime"
 )
 
-const (
-	// NoLease is a special LeaseID representing the absence of a lease.
-	NoLease = LeaseID(0)
-)
+// NoLease is a special LeaseID representing the absence of a lease.
+const NoLease = LeaseID(0)
+
+// MaxLeaseTTL is the maximum lease TTL value
+const MaxLeaseTTL = 9000000000
 
 var (
+	forever = time.Time{}
+
 	leaseBucketName = []byte("lease")
 
-	forever = monotime.Time(math.MaxInt64)
+	// maximum number of leases to revoke per second; configurable for tests
+	leaseRevokeRate = 1000
 
-	ErrNotPrimary    = errors.New("not a primary lessor")
-	ErrLeaseNotFound = errors.New("lease not found")
-	ErrLeaseExists   = errors.New("lease already exists")
+	ErrNotPrimary       = errors.New("not a primary lessor")
+	ErrLeaseNotFound    = errors.New("lease not found")
+	ErrLeaseExists      = errors.New("lease already exists")
+	ErrLeaseTTLTooLarge = errors.New("too large lease TTL")
 )
 
 // TxnDelete is a TxnWrite that only permits deletes. Defined here
@@ -96,6 +100,9 @@ type Lessor interface {
 	// Lookup gives the lease at a given lease id, if any
 	Lookup(id LeaseID) *Lease
 
+	// Leases lists all leases.
+	Leases() []*Lease
+
 	// ExpiredLeasesC returns a chan that is used to receive expired leases.
 	ExpiredLeasesC() <-chan []*Lease
 
@@ -110,21 +117,15 @@ type Lessor interface {
 // lessor implements Lessor interface.
 // TODO: use clockwork for testability.
 type lessor struct {
-	mu sync.Mutex
+	mu sync.RWMutex
 
 	// demotec is set when the lessor is the primary.
 	// demotec will be closed if the lessor is demoted.
 	demotec chan struct{}
 
-	// TODO: probably this should be a heap with a secondary
-	// id index.
-	// Now it is O(N) to loop over the leases to find expired ones.
-	// We want to make Grant, Revoke, and findExpiredLeases all O(logN) and
-	// Renew O(1).
-	// findExpiredLeases and Renew should be the most frequent operations.
-	leaseMap map[LeaseID]*Lease
-
-	itemMap map[LeaseItem]LeaseID
+	leaseMap  map[LeaseID]*Lease
+	leaseHeap LeaseQueue
+	itemMap   map[LeaseItem]LeaseID
 
 	// When a lease expires, the lessor will delete the
 	// leased range (or key) by the RangeDeleter.
@@ -153,6 +154,7 @@ func newLessor(b backend.Backend, minLeaseTTL int64) *lessor {
 	l := &lessor{
 		leaseMap:    make(map[LeaseID]*Lease),
 		itemMap:     make(map[LeaseItem]LeaseID),
+		leaseHeap:   make(LeaseQueue, 0),
 		b:           b,
 		minLeaseTTL: minLeaseTTL,
 		// expiredC is a small buffered chan to avoid unnecessary blocking.
@@ -196,6 +198,10 @@ func (le *lessor) Grant(id LeaseID, ttl int64) (*Lease, error) {
 		return nil, ErrLeaseNotFound
 	}
 
+	if ttl > MaxLeaseTTL {
+		return nil, ErrLeaseTTLTooLarge
+	}
+
 	// TODO: when lessor is under high load, it should give out lease
 	// with longer TTL to reduce renew load.
 	l := &Lease{
@@ -223,8 +229,12 @@ func (le *lessor) Grant(id LeaseID, ttl int64) (*Lease, error) {
 	}
 
 	le.leaseMap[id] = l
+	item := &LeaseWithTime{id: l.ID, expiration: l.expiry.UnixNano()}
+	heap.Push(&le.leaseHeap, item)
 	l.persistTo(le.b)
 
+	leaseTotalTTLs.Observe(float64(l.ttl))
+	leaseGranted.Inc()
 	return l, nil
 }
 
@@ -263,6 +273,8 @@ func (le *lessor) Revoke(id LeaseID) error {
 	le.b.BatchTx().UnsafeDelete(leaseBucketName, int64ToBytes(int64(l.ID)))
 
 	txn.End()
+
+	leaseRevoked.Inc()
 	return nil
 }
 
@@ -305,13 +317,33 @@ func (le *lessor) Renew(id LeaseID) (int64, error) {
 	}
 
 	l.refresh(0)
+	item := &LeaseWithTime{id: l.ID, expiration: l.expiry.UnixNano()}
+	heap.Push(&le.leaseHeap, item)
+
+	leaseRenewed.Inc()
 	return l.ttl, nil
 }
 
 func (le *lessor) Lookup(id LeaseID) *Lease {
-	le.mu.Lock()
-	defer le.mu.Unlock()
+	le.mu.RLock()
+	defer le.mu.RUnlock()
 	return le.leaseMap[id]
+}
+
+func (le *lessor) unsafeLeases() []*Lease {
+	leases := make([]*Lease, 0, len(le.leaseMap))
+	for _, l := range le.leaseMap {
+		leases = append(leases, l)
+	}
+	return leases
+}
+
+func (le *lessor) Leases() []*Lease {
+	le.mu.RLock()
+	ls := le.unsafeLeases()
+	le.mu.RUnlock()
+	sort.Sort(leasesByExpiry(ls))
+	return ls
 }
 
 func (le *lessor) Promote(extend time.Duration) {
@@ -323,8 +355,54 @@ func (le *lessor) Promote(extend time.Duration) {
 	// refresh the expiries of all leases.
 	for _, l := range le.leaseMap {
 		l.refresh(extend)
+		item := &LeaseWithTime{id: l.ID, expiration: l.expiry.UnixNano()}
+		heap.Push(&le.leaseHeap, item)
+	}
+
+	if len(le.leaseMap) < leaseRevokeRate {
+		// no possibility of lease pile-up
+		return
+	}
+
+	// adjust expiries in case of overlap
+	leases := le.unsafeLeases()
+	sort.Sort(leasesByExpiry(leases))
+
+	baseWindow := leases[0].Remaining()
+	nextWindow := baseWindow + time.Second
+	expires := 0
+	// have fewer expires than the total revoke rate so piled up leases
+	// don't consume the entire revoke limit
+	targetExpiresPerSecond := (3 * leaseRevokeRate) / 4
+	for _, l := range leases {
+		remaining := l.Remaining()
+		if remaining > nextWindow {
+			baseWindow = remaining
+			nextWindow = baseWindow + time.Second
+			expires = 1
+			continue
+		}
+		expires++
+		if expires <= targetExpiresPerSecond {
+			continue
+		}
+		rateDelay := float64(time.Second) * (float64(expires) / float64(targetExpiresPerSecond))
+		// If leases are extended by n seconds, leases n seconds ahead of the
+		// base window should be extended by only one second.
+		rateDelay -= float64(remaining - baseWindow)
+		delay := time.Duration(rateDelay)
+		nextWindow = baseWindow + delay
+		l.refresh(delay + extend)
+		item := &LeaseWithTime{id: l.ID, expiration: l.expiry.UnixNano()}
+		heap.Push(&le.leaseHeap, item)
 	}
 }
+
+type leasesByExpiry []*Lease
+
+func (le leasesByExpiry) Len() int           { return len(le) }
+func (le leasesByExpiry) Less(i, j int) bool { return le[i].Remaining() < le[j].Remaining() }
+func (le leasesByExpiry) Swap(i, j int)      { le[i], le[j] = le[j], le[i] }
 
 func (le *lessor) Demote() {
 	le.mu.Lock()
@@ -363,9 +441,9 @@ func (le *lessor) Attach(id LeaseID, items []LeaseItem) error {
 }
 
 func (le *lessor) GetLease(item LeaseItem) LeaseID {
-	le.mu.Lock()
+	le.mu.RLock()
 	id := le.itemMap[item]
-	le.mu.Unlock()
+	le.mu.RUnlock()
 	return id
 }
 
@@ -415,11 +493,14 @@ func (le *lessor) runLoop() {
 	for {
 		var ls []*Lease
 
-		le.mu.Lock()
+		// rate limit
+		revokeLimit := leaseRevokeRate / 2
+
+		le.mu.RLock()
 		if le.isPrimary() {
-			ls = le.findExpiredLeases()
+			ls = le.findExpiredLeases(revokeLimit)
 		}
-		le.mu.Unlock()
+		le.mu.RUnlock()
 
 		if len(ls) != 0 {
 			select {
@@ -441,16 +522,58 @@ func (le *lessor) runLoop() {
 	}
 }
 
-// findExpiredLeases loops all the leases in the leaseMap and returns the expired
-// leases that needed to be revoked.
-func (le *lessor) findExpiredLeases() []*Lease {
+// expireExists returns true if expiry items exist.
+// It pops only when expiry item exists.
+// "next" is true, to indicate that it may exist in next attempt.
+func (le *lessor) expireExists() (l *Lease, ok bool, next bool) {
+	if le.leaseHeap.Len() == 0 {
+		return nil, false, false
+	}
+
+	item := le.leaseHeap[0]
+	l = le.leaseMap[item.id]
+	if l == nil {
+		// lease has expired or been revoked
+		// no need to revoke (nothing is expiry)
+		heap.Pop(&le.leaseHeap) // O(log N)
+		return nil, false, true
+	}
+
+	if time.Now().UnixNano() < item.expiration {
+		// Candidate expirations are caught up, reinsert this item
+		// and no need to revoke (nothing is expiry)
+		return l, false, false
+	}
+	// if the lease is actually expired, add to the removal list. If it is not expired, we can ignore it because another entry will have been inserted into the heap
+
+	heap.Pop(&le.leaseHeap) // O(log N)
+	return l, true, false
+}
+
+// findExpiredLeases loops leases in the leaseMap until reaching expired limit
+// and returns the expired leases that needed to be revoked.
+func (le *lessor) findExpiredLeases(limit int) []*Lease {
 	leases := make([]*Lease, 0, 16)
 
-	for _, l := range le.leaseMap {
-		// TODO: probably should change to <= 100-500 millisecond to
-		// make up committing latency.
+	for {
+		l, ok, next := le.expireExists()
+		if !ok && !next {
+			break
+		}
+		if !ok {
+			continue
+		}
+		if next {
+			continue
+		}
+
 		if l.expired() {
 			leases = append(leases, l)
+
+			// reach expired limit
+			if len(leases) == limit {
+				break
+			}
 		}
 	}
 
@@ -485,6 +608,7 @@ func (le *lessor) initAndRecover() {
 			revokec: make(chan struct{}),
 		}
 	}
+	heap.Init(&le.leaseHeap)
 	tx.Unlock()
 
 	le.b.ForceCommit()
@@ -493,8 +617,10 @@ func (le *lessor) initAndRecover() {
 type Lease struct {
 	ID  LeaseID
 	ttl int64 // time to live in seconds
-	// expiry is time when lease should expire; must be 64-bit aligned.
-	expiry monotime.Time
+	// expiryMu protects concurrent accesses to expiry
+	expiryMu sync.RWMutex
+	// expiry is time when lease should expire. no expiration when expiry.IsZero() is true
+	expiry time.Time
 
 	// mu protects concurrent accesses to itemSet
 	mu      sync.RWMutex
@@ -509,7 +635,7 @@ func (l *Lease) expired() bool {
 func (l *Lease) persistTo(b backend.Backend) {
 	key := int64ToBytes(int64(l.ID))
 
-	lpb := leasepb.Lease{ID: int64(l.ID), TTL: int64(l.ttl)}
+	lpb := leasepb.Lease{ID: int64(l.ID), TTL: l.ttl}
 	val, err := lpb.Marshal()
 	if err != nil {
 		panic("failed to marshal lease proto item")
@@ -527,12 +653,18 @@ func (l *Lease) TTL() int64 {
 
 // refresh refreshes the expiry of the lease.
 func (l *Lease) refresh(extend time.Duration) {
-	t := monotime.Now().Add(extend + time.Duration(l.ttl)*time.Second)
-	atomic.StoreUint64((*uint64)(&l.expiry), uint64(t))
+	newExpiry := time.Now().Add(extend + time.Duration(l.ttl)*time.Second)
+	l.expiryMu.Lock()
+	defer l.expiryMu.Unlock()
+	l.expiry = newExpiry
 }
 
 // forever sets the expiry of lease to be forever.
-func (l *Lease) forever() { atomic.StoreUint64((*uint64)(&l.expiry), uint64(forever)) }
+func (l *Lease) forever() {
+	l.expiryMu.Lock()
+	defer l.expiryMu.Unlock()
+	l.expiry = forever
+}
 
 // Keys returns all the keys attached to the lease.
 func (l *Lease) Keys() []string {
@@ -547,8 +679,12 @@ func (l *Lease) Keys() []string {
 
 // Remaining returns the remaining time of the lease.
 func (l *Lease) Remaining() time.Duration {
-	t := monotime.Time(atomic.LoadUint64((*uint64)(&l.expiry)))
-	return time.Duration(t - monotime.Now())
+	l.expiryMu.RLock()
+	defer l.expiryMu.RUnlock()
+	if l.expiry.IsZero() {
+		return time.Duration(math.MaxInt64)
+	}
+	return time.Until(l.expiry)
 }
 
 type LeaseItem struct {
@@ -582,7 +718,9 @@ func (fl *FakeLessor) Demote() {}
 
 func (fl *FakeLessor) Renew(id LeaseID) (int64, error) { return 10, nil }
 
-func (le *FakeLessor) Lookup(id LeaseID) *Lease { return nil }
+func (fl *FakeLessor) Lookup(id LeaseID) *Lease { return nil }
+
+func (fl *FakeLessor) Leases() []*Lease { return nil }
 
 func (fl *FakeLessor) ExpiredLeasesC() <-chan []*Lease { return nil }
 

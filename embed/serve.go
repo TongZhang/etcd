@@ -15,35 +15,42 @@
 package embed
 
 import (
-	"crypto/tls"
+	"context"
+	"fmt"
 	"io/ioutil"
 	defaultLog "log"
 	"net"
 	"net/http"
-	"net/http/pprof"
 	"strings"
-	"time"
 
 	"github.com/coreos/etcd/etcdserver"
 	"github.com/coreos/etcd/etcdserver/api/v3client"
+	"github.com/coreos/etcd/etcdserver/api/v3election"
+	"github.com/coreos/etcd/etcdserver/api/v3election/v3electionpb"
+	v3electiongw "github.com/coreos/etcd/etcdserver/api/v3election/v3electionpb/gw"
 	"github.com/coreos/etcd/etcdserver/api/v3lock"
 	"github.com/coreos/etcd/etcdserver/api/v3lock/v3lockpb"
+	v3lockgw "github.com/coreos/etcd/etcdserver/api/v3lock/v3lockpb/gw"
 	"github.com/coreos/etcd/etcdserver/api/v3rpc"
-	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
+	etcdservergw "github.com/coreos/etcd/etcdserver/etcdserverpb/gw"
+	"github.com/coreos/etcd/pkg/debugutil"
+	"github.com/coreos/etcd/pkg/httputil"
 	"github.com/coreos/etcd/pkg/transport"
 
-	"github.com/cockroachdb/cmux"
 	gw "github.com/grpc-ecosystem/grpc-gateway/runtime"
-	"golang.org/x/net/context"
+	"github.com/soheilhy/cmux"
+	"github.com/tmc/grpc-websocket-proxy/wsproxy"
+	"go.uber.org/zap"
 	"golang.org/x/net/trace"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 )
 
-const pprofPrefix = "/debug/pprof"
-
 type serveCtx struct {
+	lg       *zap.Logger
 	l        net.Listener
+	addr     string
+	network  string
 	secure   bool
 	insecure bool
 
@@ -52,36 +59,66 @@ type serveCtx struct {
 
 	userHandlers    map[string]http.Handler
 	serviceRegister func(*grpc.Server)
+	serversC        chan *servers
 }
 
-func newServeCtx() *serveCtx {
+type servers struct {
+	secure bool
+	grpc   *grpc.Server
+	http   *http.Server
+}
+
+func newServeCtx(lg *zap.Logger) *serveCtx {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &serveCtx{ctx: ctx, cancel: cancel, userHandlers: make(map[string]http.Handler)}
+	return &serveCtx{
+		lg:           lg,
+		ctx:          ctx,
+		cancel:       cancel,
+		userHandlers: make(map[string]http.Handler),
+		serversC:     make(chan *servers, 2), // in case sctx.insecure,sctx.secure true
+	}
 }
 
 // serve accepts incoming connections on the listener l,
 // creating a new service goroutine for each. The service goroutines
 // read requests and then call handler to reply to them.
-func (sctx *serveCtx) serve(s *etcdserver.EtcdServer, tlscfg *tls.Config, handler http.Handler, errHandler func(error)) error {
+func (sctx *serveCtx) serve(
+	s *etcdserver.EtcdServer,
+	tlsinfo *transport.TLSInfo,
+	handler http.Handler,
+	errHandler func(error),
+	gopts ...grpc.ServerOption) (err error) {
 	logger := defaultLog.New(ioutil.Discard, "etcdhttp", 0)
 	<-s.ReadyNotify()
-	plog.Info("ready to serve client requests")
+
+	if sctx.lg == nil {
+		plog.Info("ready to serve client requests")
+	}
 
 	m := cmux.New(sctx.l)
+	v3c := v3client.New(s)
+	servElection := v3election.NewElectionServer(v3c)
+	servLock := v3lock.NewLockServer(v3c)
+
+	var gs *grpc.Server
+	defer func() {
+		if err != nil && gs != nil {
+			gs.Stop()
+		}
+	}()
 
 	if sctx.insecure {
-		gs := v3rpc.Server(s, nil)
-		v3lockpb.RegisterLockServer(gs, v3lock.NewLockServer(v3client.New(s)))
+		gs = v3rpc.Server(s, nil, gopts...)
+		v3electionpb.RegisterElectionServer(gs, servElection)
+		v3lockpb.RegisterLockServer(gs, servLock)
 		if sctx.serviceRegister != nil {
 			sctx.serviceRegister(gs)
 		}
 		grpcl := m.Match(cmux.HTTP2())
 		go func() { errHandler(gs.Serve(grpcl)) }()
 
-		opts := []grpc.DialOption{
-			grpc.WithInsecure(),
-		}
-		gwmux, err := sctx.registerGateway(opts)
+		var gwmux *gw.ServeMux
+		gwmux, err = sctx.registerGateway([]grpc.DialOption{grpc.WithInsecure()})
 		if err != nil {
 			return err
 		}
@@ -89,51 +126,79 @@ func (sctx *serveCtx) serve(s *etcdserver.EtcdServer, tlscfg *tls.Config, handle
 		httpmux := sctx.createMux(gwmux, handler)
 
 		srvhttp := &http.Server{
-			Handler:  httpmux,
+			Handler:  createAccessController(sctx.lg, s, httpmux),
 			ErrorLog: logger, // do not log user error
 		}
 		httpl := m.Match(cmux.HTTP1())
 		go func() { errHandler(srvhttp.Serve(httpl)) }()
-		plog.Noticef("serving insecure client requests on %s, this is strongly discouraged!", sctx.l.Addr().String())
+
+		sctx.serversC <- &servers{grpc: gs, http: srvhttp}
+		if sctx.lg != nil {
+			sctx.lg.Info(
+				"serving client traffic insecurely; this is strongly discouraged!",
+				zap.String("address", sctx.l.Addr().String()),
+			)
+		} else {
+			plog.Noticef("serving insecure client requests on %s, this is strongly discouraged!", sctx.l.Addr().String())
+		}
 	}
 
 	if sctx.secure {
-		gs := v3rpc.Server(s, tlscfg)
-		v3lockpb.RegisterLockServer(gs, v3lock.NewLockServer(v3client.New(s)))
+		tlscfg, tlsErr := tlsinfo.ServerConfig()
+		if tlsErr != nil {
+			return tlsErr
+		}
+		gs = v3rpc.Server(s, tlscfg, gopts...)
+		v3electionpb.RegisterElectionServer(gs, servElection)
+		v3lockpb.RegisterLockServer(gs, servLock)
 		if sctx.serviceRegister != nil {
 			sctx.serviceRegister(gs)
 		}
 		handler = grpcHandlerFunc(gs, handler)
 
-		dtls := transport.ShallowCopyTLSConfig(tlscfg)
+		dtls := tlscfg.Clone()
 		// trust local server
 		dtls.InsecureSkipVerify = true
 		creds := credentials.NewTLS(dtls)
 		opts := []grpc.DialOption{grpc.WithTransportCredentials(creds)}
-		gwmux, err := sctx.registerGateway(opts)
+		var gwmux *gw.ServeMux
+		gwmux, err = sctx.registerGateway(opts)
 		if err != nil {
 			return err
 		}
 
-		tlsl := tls.NewListener(m.Match(cmux.Any()), tlscfg)
+		var tlsl net.Listener
+		tlsl, err = transport.NewTLSListener(m.Match(cmux.Any()), tlsinfo)
+		if err != nil {
+			return err
+		}
 		// TODO: add debug flag; enable logging when debug flag is set
 		httpmux := sctx.createMux(gwmux, handler)
 
 		srv := &http.Server{
-			Handler:   httpmux,
+			Handler:   createAccessController(sctx.lg, s, httpmux),
 			TLSConfig: tlscfg,
 			ErrorLog:  logger, // do not log user error
 		}
 		go func() { errHandler(srv.Serve(tlsl)) }()
 
-		plog.Infof("serving client requests on %s", sctx.l.Addr().String())
+		sctx.serversC <- &servers{secure: true, grpc: gs, http: srv}
+		if sctx.lg != nil {
+			sctx.lg.Info(
+				"serving client traffic insecurely",
+				zap.String("address", sctx.l.Addr().String()),
+			)
+		} else {
+			plog.Infof("serving client requests on %s", sctx.l.Addr().String())
+		}
 	}
 
+	close(sctx.serversC)
 	return m.Serve()
 }
 
 // grpcHandlerFunc returns an http.Handler that delegates to grpcServer on incoming gRPC
-// connections or otherHandler otherwise. Copied from cockroachdb.
+// connections or otherHandler otherwise. Given in gRPC docs.
 func grpcHandlerFunc(grpcServer *grpc.Server, otherHandler http.Handler) http.Handler {
 	if otherHandler == nil {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -149,46 +214,53 @@ func grpcHandlerFunc(grpcServer *grpc.Server, otherHandler http.Handler) http.Ha
 	})
 }
 
-func servePeerHTTP(l net.Listener, handler http.Handler) error {
-	logger := defaultLog.New(ioutil.Discard, "etcdhttp", 0)
-	// TODO: add debug flag; enable logging when debug flag is set
-	srv := &http.Server{
-		Handler:     handler,
-		ReadTimeout: 5 * time.Minute,
-		ErrorLog:    logger, // do not log user error
-	}
-	return srv.Serve(l)
-}
+type registerHandlerFunc func(context.Context, *gw.ServeMux, *grpc.ClientConn) error
 
 func (sctx *serveCtx) registerGateway(opts []grpc.DialOption) (*gw.ServeMux, error) {
 	ctx := sctx.ctx
-	addr := sctx.l.Addr().String()
+
+	addr := sctx.addr
+	if network := sctx.network; network == "unix" {
+		// explicitly define unix network for gRPC socket support
+		addr = fmt.Sprintf("%s://%s", network, addr)
+	}
+
+	conn, err := grpc.DialContext(ctx, addr, opts...)
+	if err != nil {
+		return nil, err
+	}
 	gwmux := gw.NewServeMux()
 
-	err := pb.RegisterKVHandlerFromEndpoint(ctx, gwmux, addr, opts)
-	if err != nil {
-		return nil, err
+	handlers := []registerHandlerFunc{
+		etcdservergw.RegisterKVHandler,
+		etcdservergw.RegisterWatchHandler,
+		etcdservergw.RegisterLeaseHandler,
+		etcdservergw.RegisterClusterHandler,
+		etcdservergw.RegisterMaintenanceHandler,
+		etcdservergw.RegisterAuthHandler,
+		v3lockgw.RegisterLockHandler,
+		v3electiongw.RegisterElectionHandler,
 	}
-	err = pb.RegisterWatchHandlerFromEndpoint(ctx, gwmux, addr, opts)
-	if err != nil {
-		return nil, err
+	for _, h := range handlers {
+		if err := h(ctx, gwmux, conn); err != nil {
+			return nil, err
+		}
 	}
-	err = pb.RegisterLeaseHandlerFromEndpoint(ctx, gwmux, addr, opts)
-	if err != nil {
-		return nil, err
-	}
-	err = pb.RegisterClusterHandlerFromEndpoint(ctx, gwmux, addr, opts)
-	if err != nil {
-		return nil, err
-	}
-	err = pb.RegisterMaintenanceHandlerFromEndpoint(ctx, gwmux, addr, opts)
-	if err != nil {
-		return nil, err
-	}
-	err = pb.RegisterAuthHandlerFromEndpoint(ctx, gwmux, addr, opts)
-	if err != nil {
-		return nil, err
-	}
+	go func() {
+		<-ctx.Done()
+		if cerr := conn.Close(); cerr != nil {
+			if sctx.lg != nil {
+				sctx.lg.Warn(
+					"failed to close connection",
+					zap.String("address", sctx.l.Addr().String()),
+					zap.Error(cerr),
+				)
+			} else {
+				plog.Warningf("failed to close conn to %s: %v", sctx.l.Addr().String(), cerr)
+			}
+		}
+	}()
+
 	return gwmux, nil
 }
 
@@ -198,32 +270,144 @@ func (sctx *serveCtx) createMux(gwmux *gw.ServeMux, handler http.Handler) *http.
 		httpmux.Handle(path, h)
 	}
 
-	httpmux.Handle("/v3alpha/", gwmux)
+	httpmux.Handle(
+		"/v3/",
+		wsproxy.WebsocketProxy(
+			gwmux,
+			wsproxy.WithRequestMutator(
+				// Default to the POST method for streams
+				func(incoming *http.Request, outgoing *http.Request) *http.Request {
+					outgoing.Method = "POST"
+					return outgoing
+				},
+			),
+		),
+	)
 	if handler != nil {
 		httpmux.Handle("/", handler)
 	}
 	return httpmux
 }
 
+// createAccessController wraps HTTP multiplexer:
+// - mutate gRPC gateway request paths
+// - check hostname whitelist
+// client HTTP requests goes here first
+func createAccessController(lg *zap.Logger, s *etcdserver.EtcdServer, mux *http.ServeMux) http.Handler {
+	return &accessController{lg: lg, s: s, mux: mux}
+}
+
+type accessController struct {
+	lg  *zap.Logger
+	s   *etcdserver.EtcdServer
+	mux *http.ServeMux
+}
+
+func (ac *accessController) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	// redirect for backward compatibilities
+	if req != nil && req.URL != nil && strings.HasPrefix(req.URL.Path, "/v3beta/") {
+		req.URL.Path = strings.Replace(req.URL.Path, "/v3beta/", "/v3/", 1)
+	}
+
+	if req.TLS == nil { // check origin if client connection is not secure
+		host := httputil.GetHostname(req)
+		if !ac.s.AccessController.IsHostWhitelisted(host) {
+			if ac.lg != nil {
+				ac.lg.Warn(
+					"rejecting HTTP request to prevent DNS rebinding attacks",
+					zap.String("host", host),
+				)
+			} else {
+				plog.Warningf("rejecting HTTP request from %q to prevent DNS rebinding attacks", host)
+			}
+			// TODO: use Go's "http.StatusMisdirectedRequest" (421)
+			// https://github.com/golang/go/commit/4b8a7eafef039af1834ef9bfa879257c4a72b7b5
+			http.Error(rw, errCVE20185702(host), 421)
+			return
+		}
+	}
+
+	// Write CORS header.
+	if ac.s.AccessController.OriginAllowed("*") {
+		addCORSHeader(rw, "*")
+	} else if origin := req.Header.Get("Origin"); ac.s.OriginAllowed(origin) {
+		addCORSHeader(rw, origin)
+	}
+
+	if req.Method == "OPTIONS" {
+		rw.WriteHeader(http.StatusOK)
+		return
+	}
+
+	ac.mux.ServeHTTP(rw, req)
+}
+
+// addCORSHeader adds the correct cors headers given an origin
+func addCORSHeader(w http.ResponseWriter, origin string) {
+	w.Header().Add("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
+	w.Header().Add("Access-Control-Allow-Origin", origin)
+	w.Header().Add("Access-Control-Allow-Headers", "accept, content-type, authorization")
+}
+
+// https://github.com/transmission/transmission/pull/468
+func errCVE20185702(host string) string {
+	return fmt.Sprintf(`
+etcd received your request, but the Host header was unrecognized.
+
+To fix this, choose one of the following options:
+- Enable TLS, then any HTTPS request will be allowed.
+- Add the hostname you want to use to the whitelist in settings.
+  - e.g. etcd --host-whitelist %q
+
+This requirement has been added to help prevent "DNS Rebinding" attacks (CVE-2018-5702).
+`, host)
+}
+
+// WrapCORS wraps existing handler with CORS.
+// TODO: deprecate this after v2 proxy deprecate
+func WrapCORS(cors map[string]struct{}, h http.Handler) http.Handler {
+	return &corsHandler{
+		ac: &etcdserver.AccessController{CORS: cors},
+		h:  h,
+	}
+}
+
+type corsHandler struct {
+	ac *etcdserver.AccessController
+	h  http.Handler
+}
+
+func (ch *corsHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	if ch.ac.OriginAllowed("*") {
+		addCORSHeader(rw, "*")
+	} else if origin := req.Header.Get("Origin"); ch.ac.OriginAllowed(origin) {
+		addCORSHeader(rw, origin)
+	}
+
+	if req.Method == "OPTIONS" {
+		rw.WriteHeader(http.StatusOK)
+		return
+	}
+
+	ch.h.ServeHTTP(rw, req)
+}
+
 func (sctx *serveCtx) registerUserHandler(s string, h http.Handler) {
 	if sctx.userHandlers[s] != nil {
-		plog.Warningf("path %s already registered by user handler", s)
+		if sctx.lg != nil {
+			sctx.lg.Warn("path is already registered by user handler", zap.String("path", s))
+		} else {
+			plog.Warningf("path %s already registered by user handler", s)
+		}
 		return
 	}
 	sctx.userHandlers[s] = h
 }
 
 func (sctx *serveCtx) registerPprof() {
-	sctx.registerUserHandler(pprofPrefix+"/", http.HandlerFunc(pprof.Index))
-	sctx.registerUserHandler(pprofPrefix+"/profile", http.HandlerFunc(pprof.Profile))
-	sctx.registerUserHandler(pprofPrefix+"/symbol", http.HandlerFunc(pprof.Symbol))
-	sctx.registerUserHandler(pprofPrefix+"/cmdline", http.HandlerFunc(pprof.Cmdline))
-	sctx.registerUserHandler(pprofPrefix+"/trace", http.HandlerFunc(pprof.Trace))
-
-	sctx.registerUserHandler(pprofPrefix+"/heap", pprof.Handler("heap"))
-	sctx.registerUserHandler(pprofPrefix+"/goroutine", pprof.Handler("goroutine"))
-	sctx.registerUserHandler(pprofPrefix+"/threadcreate", pprof.Handler("threadcreate"))
-	sctx.registerUserHandler(pprofPrefix+"/block", pprof.Handler("block"))
+	for p, h := range debugutil.PProfHandlers() {
+		sctx.registerUserHandler(p, h)
+	}
 }
 
 func (sctx *serveCtx) registerTrace() {

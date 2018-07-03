@@ -303,8 +303,15 @@ func TestLeaderElectionPreVote(t *testing.T) {
 
 func testLeaderElection(t *testing.T, preVote bool) {
 	var cfg func(*Config)
+	candState := StateType(StateCandidate)
+	candTerm := uint64(1)
 	if preVote {
 		cfg = preVoteConfig
+		// In pre-vote mode, an election that fails to complete
+		// leaves the node in pre-candidate state without advancing
+		// the term.
+		candState = StatePreCandidate
+		candTerm = 0
 	}
 	tests := []struct {
 		*network
@@ -313,8 +320,8 @@ func testLeaderElection(t *testing.T, preVote bool) {
 	}{
 		{newNetworkWithConfig(cfg, nil, nil, nil), StateLeader, 1},
 		{newNetworkWithConfig(cfg, nil, nil, nopStepper), StateLeader, 1},
-		{newNetworkWithConfig(cfg, nil, nopStepper, nopStepper), StateCandidate, 1},
-		{newNetworkWithConfig(cfg, nil, nopStepper, nopStepper, nil), StateCandidate, 1},
+		{newNetworkWithConfig(cfg, nil, nopStepper, nopStepper), candState, candTerm},
+		{newNetworkWithConfig(cfg, nil, nopStepper, nopStepper, nil), candState, candTerm},
 		{newNetworkWithConfig(cfg, nil, nopStepper, nopStepper, nil, nil), StateLeader, 1},
 
 		// three logs further along than 0, but in the same term so rejections
@@ -327,24 +334,97 @@ func testLeaderElection(t *testing.T, preVote bool) {
 	for i, tt := range tests {
 		tt.send(pb.Message{From: 1, To: 1, Type: pb.MsgHup})
 		sm := tt.network.peers[1].(*raft)
-		var expState StateType
-		var expTerm uint64
-		if tt.state == StateCandidate && preVote {
-			// In pre-vote mode, an election that fails to complete
-			// leaves the node in pre-candidate state without advancing
-			// the term.
-			expState = StatePreCandidate
-			expTerm = 0
-		} else {
-			expState = tt.state
-			expTerm = tt.expTerm
+		if sm.state != tt.state {
+			t.Errorf("#%d: state = %s, want %s", i, sm.state, tt.state)
 		}
-		if sm.state != expState {
-			t.Errorf("#%d: state = %s, want %s", i, sm.state, expState)
+		if g := sm.Term; g != tt.expTerm {
+			t.Errorf("#%d: term = %d, want %d", i, g, tt.expTerm)
 		}
-		if g := sm.Term; g != expTerm {
-			t.Errorf("#%d: term = %d, want %d", i, g, expTerm)
-		}
+	}
+}
+
+// TestLearnerElectionTimeout verfies that the leader should not start election even
+// when times out.
+func TestLearnerElectionTimeout(t *testing.T) {
+	n1 := newTestLearnerRaft(1, []uint64{1}, []uint64{2}, 10, 1, NewMemoryStorage())
+	n2 := newTestLearnerRaft(2, []uint64{1}, []uint64{2}, 10, 1, NewMemoryStorage())
+
+	n1.becomeFollower(1, None)
+	n2.becomeFollower(1, None)
+
+	// n2 is learner. Learner should not start election even when times out.
+	setRandomizedElectionTimeout(n2, n2.electionTimeout)
+	for i := 0; i < n2.electionTimeout; i++ {
+		n2.tick()
+	}
+
+	if n2.state != StateFollower {
+		t.Errorf("peer 2 state: %s, want %s", n2.state, StateFollower)
+	}
+}
+
+// TestLearnerPromotion verifies that the learner should not election until
+// it is promoted to a normal peer.
+func TestLearnerPromotion(t *testing.T) {
+	n1 := newTestLearnerRaft(1, []uint64{1}, []uint64{2}, 10, 1, NewMemoryStorage())
+	n2 := newTestLearnerRaft(2, []uint64{1}, []uint64{2}, 10, 1, NewMemoryStorage())
+
+	n1.becomeFollower(1, None)
+	n2.becomeFollower(1, None)
+
+	nt := newNetwork(n1, n2)
+
+	if n1.state == StateLeader {
+		t.Error("peer 1 state is leader, want not", n1.state)
+	}
+
+	// n1 should become leader
+	setRandomizedElectionTimeout(n1, n1.electionTimeout)
+	for i := 0; i < n1.electionTimeout; i++ {
+		n1.tick()
+	}
+
+	if n1.state != StateLeader {
+		t.Errorf("peer 1 state: %s, want %s", n1.state, StateLeader)
+	}
+	if n2.state != StateFollower {
+		t.Errorf("peer 2 state: %s, want %s", n2.state, StateFollower)
+	}
+
+	nt.send(pb.Message{From: 1, To: 1, Type: pb.MsgBeat})
+
+	n1.addNode(2)
+	n2.addNode(2)
+	if n2.isLearner {
+		t.Error("peer 2 is learner, want not")
+	}
+
+	// n2 start election, should become leader
+	setRandomizedElectionTimeout(n2, n2.electionTimeout)
+	for i := 0; i < n2.electionTimeout; i++ {
+		n2.tick()
+	}
+
+	nt.send(pb.Message{From: 2, To: 2, Type: pb.MsgBeat})
+
+	if n1.state != StateFollower {
+		t.Errorf("peer 1 state: %s, want %s", n1.state, StateFollower)
+	}
+	if n2.state != StateLeader {
+		t.Errorf("peer 2 state: %s, want %s", n2.state, StateLeader)
+	}
+}
+
+// TestLearnerCannotVote checks that a learner can't vote even it receives a valid Vote request.
+func TestLearnerCannotVote(t *testing.T) {
+	n2 := newTestLearnerRaft(2, []uint64{1}, []uint64{2}, 10, 1, NewMemoryStorage())
+
+	n2.becomeFollower(1, None)
+
+	n2.Step(pb.Message{From: 1, To: 2, Term: 2, Type: pb.MsgVote, LogTerm: 11, Index: 11})
+
+	if len(n2.msgs) != 0 {
+		t.Errorf("expect learner not to vote, but received %v messages", n2.msgs)
 	}
 }
 
@@ -597,6 +677,47 @@ func TestLogReplication(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// TestLearnerLogReplication tests that a learner can receive entries from the leader.
+func TestLearnerLogReplication(t *testing.T) {
+	n1 := newTestLearnerRaft(1, []uint64{1}, []uint64{2}, 10, 1, NewMemoryStorage())
+	n2 := newTestLearnerRaft(2, []uint64{1}, []uint64{2}, 10, 1, NewMemoryStorage())
+
+	nt := newNetwork(n1, n2)
+
+	n1.becomeFollower(1, None)
+	n2.becomeFollower(1, None)
+
+	setRandomizedElectionTimeout(n1, n1.electionTimeout)
+	for i := 0; i < n1.electionTimeout; i++ {
+		n1.tick()
+	}
+
+	nt.send(pb.Message{From: 1, To: 1, Type: pb.MsgBeat})
+
+	// n1 is leader and n2 is learner
+	if n1.state != StateLeader {
+		t.Errorf("peer 1 state: %s, want %s", n1.state, StateLeader)
+	}
+	if !n2.isLearner {
+		t.Error("peer 2 state: not learner, want yes")
+	}
+
+	nextCommitted := n1.raftLog.committed + 1
+	nt.send(pb.Message{From: 1, To: 1, Type: pb.MsgProp, Entries: []pb.Entry{{Data: []byte("somedata")}}})
+	if n1.raftLog.committed != nextCommitted {
+		t.Errorf("peer 1 wants committed to %d, but still %d", nextCommitted, n1.raftLog.committed)
+	}
+
+	if n1.raftLog.committed != n2.raftLog.committed {
+		t.Errorf("peer 2 wants committed to %d, but still %d", n1.raftLog.committed, n2.raftLog.committed)
+	}
+
+	match := n1.getProgress(2).Match
+	if match != n2.raftLog.committed {
+		t.Errorf("progress 2 of leader 1 wants match %d, but got %d", n2.raftLog.committed, match)
 	}
 }
 
@@ -1056,9 +1177,9 @@ func TestCommit(t *testing.T) {
 		storage.Append(tt.logs)
 		storage.hardState = pb.HardState{Term: tt.smTerm}
 
-		sm := newTestRaft(1, []uint64{1}, 5, 1, storage)
+		sm := newTestRaft(1, []uint64{1}, 10, 2, storage)
 		for j := 0; j < len(tt.matches); j++ {
-			sm.setProgress(uint64(j)+1, tt.matches[j], tt.matches[j]+1)
+			sm.setProgress(uint64(j)+1, tt.matches[j], tt.matches[j]+1, false)
 		}
 		sm.maybeCommit()
 		if g := sm.raftLog.committed; g != tt.w {
@@ -1105,8 +1226,9 @@ func TestPastElectionTimeout(t *testing.T) {
 // actual stepX function.
 func TestStepIgnoreOldTermMsg(t *testing.T) {
 	called := false
-	fakeStep := func(r *raft, m pb.Message) {
+	fakeStep := func(r *raft, m pb.Message) error {
 		called = true
+		return nil
 	}
 	sm := newTestRaft(1, []uint64{1}, 10, 1, NewMemoryStorage())
 	sm.step = fakeStep
@@ -1361,12 +1483,16 @@ func TestRecvMsgVote(t *testing.T) {
 	testRecvMsgVote(t, pb.MsgVote)
 }
 
+func TestRecvMsgPreVote(t *testing.T) {
+	testRecvMsgVote(t, pb.MsgPreVote)
+}
+
 func testRecvMsgVote(t *testing.T, msgType pb.MessageType) {
 	tests := []struct {
-		state   StateType
-		i, term uint64
-		voteFor uint64
-		wreject bool
+		state          StateType
+		index, logTerm uint64
+		voteFor        uint64
+		wreject        bool
 	}{
 		{StateFollower, 0, 0, None, true},
 		{StateFollower, 0, 1, None, true},
@@ -1396,6 +1522,13 @@ func testRecvMsgVote(t *testing.T, msgType pb.MessageType) {
 		{StateCandidate, 3, 3, 1, true},
 	}
 
+	max := func(a, b uint64) uint64 {
+		if a > b {
+			return a
+		}
+		return b
+	}
+
 	for i, tt := range tests {
 		sm := newTestRaft(1, []uint64{1}, 10, 1, NewMemoryStorage())
 		sm.state = tt.state
@@ -1413,7 +1546,17 @@ func testRecvMsgVote(t *testing.T, msgType pb.MessageType) {
 			unstable: unstable{offset: 3},
 		}
 
-		sm.Step(pb.Message{Type: msgType, From: 2, Index: tt.i, LogTerm: tt.term})
+		// raft.Term is greater than or equal to raft.raftLog.lastTerm. In this
+		// test we're only testing MsgVote responses when the campaigning node
+		// has a different raft log compared to the recipient node.
+		// Additionally we're verifying behaviour when the recipient node has
+		// already given out its vote for its current term. We're not testing
+		// what the recipient node does when receiving a message with a
+		// different term number, so we simply initialize both term numbers to
+		// be the same.
+		term := max(sm.raftLog.lastTerm(), tt.logTerm)
+		sm.Term = term
+		sm.Step(pb.Message{Type: msgType, Term: term, From: 2, Index: tt.index, LogTerm: tt.logTerm})
 
 		msgs := sm.readMessages()
 		if g := len(msgs); g != 1 {
@@ -1546,6 +1689,74 @@ func TestAllServerStepdown(t *testing.T) {
 				t.Errorf("#%d, sm.lead = %d, want %d", i, sm.lead, None)
 			}
 		}
+	}
+}
+
+func TestCandidateResetTermMsgHeartbeat(t *testing.T) {
+	testCandidateResetTerm(t, pb.MsgHeartbeat)
+}
+
+func TestCandidateResetTermMsgApp(t *testing.T) {
+	testCandidateResetTerm(t, pb.MsgApp)
+}
+
+// testCandidateResetTerm tests when a candidate receives a
+// MsgHeartbeat or MsgApp from leader, "Step" resets the term
+// with leader's and reverts back to follower.
+func testCandidateResetTerm(t *testing.T, mt pb.MessageType) {
+	a := newTestRaft(1, []uint64{1, 2, 3}, 10, 1, NewMemoryStorage())
+	b := newTestRaft(2, []uint64{1, 2, 3}, 10, 1, NewMemoryStorage())
+	c := newTestRaft(3, []uint64{1, 2, 3}, 10, 1, NewMemoryStorage())
+
+	nt := newNetwork(a, b, c)
+
+	nt.send(pb.Message{From: 1, To: 1, Type: pb.MsgHup})
+	if a.state != StateLeader {
+		t.Errorf("state = %s, want %s", a.state, StateLeader)
+	}
+	if b.state != StateFollower {
+		t.Errorf("state = %s, want %s", b.state, StateFollower)
+	}
+	if c.state != StateFollower {
+		t.Errorf("state = %s, want %s", c.state, StateFollower)
+	}
+
+	// isolate 3 and increase term in rest
+	nt.isolate(3)
+
+	nt.send(pb.Message{From: 2, To: 2, Type: pb.MsgHup})
+	nt.send(pb.Message{From: 1, To: 1, Type: pb.MsgHup})
+
+	if a.state != StateLeader {
+		t.Errorf("state = %s, want %s", a.state, StateLeader)
+	}
+	if b.state != StateFollower {
+		t.Errorf("state = %s, want %s", b.state, StateFollower)
+	}
+
+	// trigger campaign in isolated c
+	c.resetRandomizedElectionTimeout()
+	for i := 0; i < c.randomizedElectionTimeout; i++ {
+		c.tick()
+	}
+
+	if c.state != StateCandidate {
+		t.Errorf("state = %s, want %s", c.state, StateCandidate)
+	}
+
+	nt.recover()
+
+	// leader sends to isolated candidate
+	// and expects candidate to revert to follower
+	nt.send(pb.Message{From: 1, To: 3, Term: a.Term, Type: mt})
+
+	if c.state != StateFollower {
+		t.Errorf("state = %s, want %s", c.state, StateFollower)
+	}
+
+	// follower c term is reset with leader's
+	if a.Term != c.Term {
+		t.Errorf("follower term expected same term as leader's %d, got %d", a.Term, c.Term)
 	}
 }
 
@@ -1734,6 +1945,13 @@ func TestFreeStuckCandidateWithCheckQuorum(t *testing.T) {
 	if c.Term != a.Term {
 		t.Errorf("term = %d, want %d", c.Term, a.Term)
 	}
+
+	// Vote again, should become leader this time
+	nt.send(pb.Message{From: 3, To: 3, Type: pb.MsgHup})
+
+	if c.state != StateLeader {
+		t.Errorf("peer 3 state: %s, want %s", c.state, StateLeader)
+	}
 }
 
 func TestNonPromotableVoterWithCheckQuorum(t *testing.T) {
@@ -1767,6 +1985,207 @@ func TestNonPromotableVoterWithCheckQuorum(t *testing.T) {
 
 	if b.lead != 1 {
 		t.Errorf("lead = %d, want 1", b.lead)
+	}
+}
+
+// TestDisruptiveFollower tests isolated follower,
+// with slow network incoming from leader, election times out
+// to become a candidate with an increased term. Then, the
+// candiate's response to late leader heartbeat forces the leader
+// to step down.
+func TestDisruptiveFollower(t *testing.T) {
+	n1 := newTestRaft(1, []uint64{1, 2, 3}, 10, 1, NewMemoryStorage())
+	n2 := newTestRaft(2, []uint64{1, 2, 3}, 10, 1, NewMemoryStorage())
+	n3 := newTestRaft(3, []uint64{1, 2, 3}, 10, 1, NewMemoryStorage())
+
+	n1.checkQuorum = true
+	n2.checkQuorum = true
+	n3.checkQuorum = true
+
+	n1.becomeFollower(1, None)
+	n2.becomeFollower(1, None)
+	n3.becomeFollower(1, None)
+
+	nt := newNetwork(n1, n2, n3)
+
+	nt.send(pb.Message{From: 1, To: 1, Type: pb.MsgHup})
+
+	// check state
+	// n1.state == StateLeader
+	// n2.state == StateFollower
+	// n3.state == StateFollower
+	if n1.state != StateLeader {
+		t.Fatalf("node 1 state: %s, want %s", n1.state, StateLeader)
+	}
+	if n2.state != StateFollower {
+		t.Fatalf("node 2 state: %s, want %s", n2.state, StateFollower)
+	}
+	if n3.state != StateFollower {
+		t.Fatalf("node 3 state: %s, want %s", n3.state, StateFollower)
+	}
+
+	// etcd server "advanceTicksForElection" on restart;
+	// this is to expedite campaign trigger when given larger
+	// election timeouts (e.g. multi-datacenter deploy)
+	// Or leader messages are being delayed while ticks elapse
+	setRandomizedElectionTimeout(n3, n3.electionTimeout+2)
+	for i := 0; i < n3.randomizedElectionTimeout-1; i++ {
+		n3.tick()
+	}
+
+	// ideally, before last election tick elapses,
+	// the follower n3 receives "pb.MsgApp" or "pb.MsgHeartbeat"
+	// from leader n1, and then resets its "electionElapsed"
+	// however, last tick may elapse before receiving any
+	// messages from leader, thus triggering campaign
+	n3.tick()
+
+	// n1 is still leader yet
+	// while its heartbeat to candidate n3 is being delayed
+
+	// check state
+	// n1.state == StateLeader
+	// n2.state == StateFollower
+	// n3.state == StateCandidate
+	if n1.state != StateLeader {
+		t.Fatalf("node 1 state: %s, want %s", n1.state, StateLeader)
+	}
+	if n2.state != StateFollower {
+		t.Fatalf("node 2 state: %s, want %s", n2.state, StateFollower)
+	}
+	if n3.state != StateCandidate {
+		t.Fatalf("node 3 state: %s, want %s", n3.state, StateCandidate)
+	}
+	// check term
+	// n1.Term == 2
+	// n2.Term == 2
+	// n3.Term == 3
+	if n1.Term != 2 {
+		t.Fatalf("node 1 term: %d, want %d", n1.Term, 2)
+	}
+	if n2.Term != 2 {
+		t.Fatalf("node 2 term: %d, want %d", n2.Term, 2)
+	}
+	if n3.Term != 3 {
+		t.Fatalf("node 3 term: %d, want %d", n3.Term, 3)
+	}
+
+	// while outgoing vote requests are still queued in n3,
+	// leader heartbeat finally arrives at candidate n3
+	// however, due to delayed network from leader, leader
+	// heartbeat was sent with lower term than candidate's
+	nt.send(pb.Message{From: 1, To: 3, Term: n1.Term, Type: pb.MsgHeartbeat})
+
+	// then candidate n3 responds with "pb.MsgAppResp" of higher term
+	// and leader steps down from a message with higher term
+	// this is to disrupt the current leader, so that candidate
+	// with higher term can be freed with following election
+
+	// check state
+	// n1.state == StateFollower
+	// n2.state == StateFollower
+	// n3.state == StateCandidate
+	if n1.state != StateFollower {
+		t.Fatalf("node 1 state: %s, want %s", n1.state, StateFollower)
+	}
+	if n2.state != StateFollower {
+		t.Fatalf("node 2 state: %s, want %s", n2.state, StateFollower)
+	}
+	if n3.state != StateCandidate {
+		t.Fatalf("node 3 state: %s, want %s", n3.state, StateCandidate)
+	}
+	// check term
+	// n1.Term == 3
+	// n2.Term == 2
+	// n3.Term == 3
+	if n1.Term != 3 {
+		t.Fatalf("node 1 term: %d, want %d", n1.Term, 3)
+	}
+	if n2.Term != 2 {
+		t.Fatalf("node 2 term: %d, want %d", n2.Term, 2)
+	}
+	if n3.Term != 3 {
+		t.Fatalf("node 3 term: %d, want %d", n3.Term, 3)
+	}
+}
+
+// TestDisruptiveFollowerPreVote tests isolated follower,
+// with slow network incoming from leader, election times out
+// to become a pre-candidate with less log than current leader.
+// Then pre-vote phase prevents this isolated node from forcing
+// current leader to step down, thus less disruptions.
+func TestDisruptiveFollowerPreVote(t *testing.T) {
+	n1 := newTestRaft(1, []uint64{1, 2, 3}, 10, 1, NewMemoryStorage())
+	n2 := newTestRaft(2, []uint64{1, 2, 3}, 10, 1, NewMemoryStorage())
+	n3 := newTestRaft(3, []uint64{1, 2, 3}, 10, 1, NewMemoryStorage())
+
+	n1.checkQuorum = true
+	n2.checkQuorum = true
+	n3.checkQuorum = true
+
+	n1.becomeFollower(1, None)
+	n2.becomeFollower(1, None)
+	n3.becomeFollower(1, None)
+
+	nt := newNetwork(n1, n2, n3)
+
+	nt.send(pb.Message{From: 1, To: 1, Type: pb.MsgHup})
+
+	// check state
+	// n1.state == StateLeader
+	// n2.state == StateFollower
+	// n3.state == StateFollower
+	if n1.state != StateLeader {
+		t.Fatalf("node 1 state: %s, want %s", n1.state, StateLeader)
+	}
+	if n2.state != StateFollower {
+		t.Fatalf("node 2 state: %s, want %s", n2.state, StateFollower)
+	}
+	if n3.state != StateFollower {
+		t.Fatalf("node 3 state: %s, want %s", n3.state, StateFollower)
+	}
+
+	nt.isolate(3)
+	nt.send(pb.Message{From: 1, To: 1, Type: pb.MsgProp, Entries: []pb.Entry{{Data: []byte("somedata")}}})
+	nt.send(pb.Message{From: 1, To: 1, Type: pb.MsgProp, Entries: []pb.Entry{{Data: []byte("somedata")}}})
+	nt.send(pb.Message{From: 1, To: 1, Type: pb.MsgProp, Entries: []pb.Entry{{Data: []byte("somedata")}}})
+	n1.preVote = true
+	n2.preVote = true
+	n3.preVote = true
+	nt.recover()
+	nt.send(pb.Message{From: 3, To: 3, Type: pb.MsgHup})
+
+	// check state
+	// n1.state == StateLeader
+	// n2.state == StateFollower
+	// n3.state == StatePreCandidate
+	if n1.state != StateLeader {
+		t.Fatalf("node 1 state: %s, want %s", n1.state, StateLeader)
+	}
+	if n2.state != StateFollower {
+		t.Fatalf("node 2 state: %s, want %s", n2.state, StateFollower)
+	}
+	if n3.state != StatePreCandidate {
+		t.Fatalf("node 3 state: %s, want %s", n3.state, StatePreCandidate)
+	}
+	// check term
+	// n1.Term == 2
+	// n2.Term == 2
+	// n3.Term == 2
+	if n1.Term != 2 {
+		t.Fatalf("node 1 term: %d, want %d", n1.Term, 2)
+	}
+	if n2.Term != 2 {
+		t.Fatalf("node 2 term: %d, want %d", n2.Term, 2)
+	}
+	if n3.Term != 2 {
+		t.Fatalf("node 2 term: %d, want %d", n3.Term, 2)
+	}
+
+	// delayed leader heartbeat does not force current leader to step down
+	nt.send(pb.Message{From: 1, To: 3, Term: n1.Term, Type: pb.MsgHeartbeat})
+	if n1.state != StateLeader {
+		t.Fatalf("node 1 state: %s, want %s", n1.state, StateLeader)
 	}
 }
 
@@ -1878,30 +2297,6 @@ func TestReadOnlyOptionLease(t *testing.T) {
 			t.Errorf("#%d: requestCtx = %v, want %v", i, rs.RequestCtx, tt.wctx)
 		}
 		r.readStates = nil
-	}
-}
-
-func TestReadOnlyOptionLeaseWithoutCheckQuorum(t *testing.T) {
-	a := newTestRaft(1, []uint64{1, 2, 3}, 10, 1, NewMemoryStorage())
-	b := newTestRaft(2, []uint64{1, 2, 3}, 10, 1, NewMemoryStorage())
-	c := newTestRaft(3, []uint64{1, 2, 3}, 10, 1, NewMemoryStorage())
-	a.readOnly.option = ReadOnlyLeaseBased
-	b.readOnly.option = ReadOnlyLeaseBased
-	c.readOnly.option = ReadOnlyLeaseBased
-
-	nt := newNetwork(a, b, c)
-	nt.send(pb.Message{From: 1, To: 1, Type: pb.MsgHup})
-
-	ctx := []byte("ctx1")
-	nt.send(pb.Message{From: 2, To: 2, Type: pb.MsgReadIndex, Entries: []pb.Entry{{Data: ctx}}})
-
-	rs := b.readStates[0]
-	if rs.Index != None {
-		t.Errorf("readIndex = %d, want %d", rs.Index, None)
-	}
-
-	if !bytes.Equal(rs.RequestCtx, ctx) {
-		t.Errorf("requestCtx = %v, want %v", rs.RequestCtx, ctx)
 	}
 }
 
@@ -2322,6 +2717,134 @@ func TestRestore(t *testing.T) {
 	}
 }
 
+// TestRestoreWithLearner restores a snapshot which contains learners.
+func TestRestoreWithLearner(t *testing.T) {
+	s := pb.Snapshot{
+		Metadata: pb.SnapshotMetadata{
+			Index:     11, // magic number
+			Term:      11, // magic number
+			ConfState: pb.ConfState{Nodes: []uint64{1, 2}, Learners: []uint64{3}},
+		},
+	}
+
+	storage := NewMemoryStorage()
+	sm := newTestLearnerRaft(3, []uint64{1, 2}, []uint64{3}, 8, 2, storage)
+	if ok := sm.restore(s); !ok {
+		t.Error("restore fail, want succeed")
+	}
+
+	if sm.raftLog.lastIndex() != s.Metadata.Index {
+		t.Errorf("log.lastIndex = %d, want %d", sm.raftLog.lastIndex(), s.Metadata.Index)
+	}
+	if mustTerm(sm.raftLog.term(s.Metadata.Index)) != s.Metadata.Term {
+		t.Errorf("log.lastTerm = %d, want %d", mustTerm(sm.raftLog.term(s.Metadata.Index)), s.Metadata.Term)
+	}
+	sg := sm.nodes()
+	if len(sg) != len(s.Metadata.ConfState.Nodes) {
+		t.Errorf("sm.Nodes = %+v, length not equal with %+v", sg, s.Metadata.ConfState.Nodes)
+	}
+	lns := sm.learnerNodes()
+	if len(lns) != len(s.Metadata.ConfState.Learners) {
+		t.Errorf("sm.LearnerNodes = %+v, length not equal with %+v", sg, s.Metadata.ConfState.Learners)
+	}
+	for _, n := range s.Metadata.ConfState.Nodes {
+		if sm.prs[n].IsLearner {
+			t.Errorf("sm.Node %x isLearner = %s, want %t", n, sm.prs[n], false)
+		}
+	}
+	for _, n := range s.Metadata.ConfState.Learners {
+		if !sm.learnerPrs[n].IsLearner {
+			t.Errorf("sm.Node %x isLearner = %s, want %t", n, sm.prs[n], true)
+		}
+	}
+
+	if ok := sm.restore(s); ok {
+		t.Error("restore succeed, want fail")
+	}
+}
+
+// TestRestoreInvalidLearner verfies that a normal peer can't become learner again
+// when restores snapshot.
+func TestRestoreInvalidLearner(t *testing.T) {
+	s := pb.Snapshot{
+		Metadata: pb.SnapshotMetadata{
+			Index:     11, // magic number
+			Term:      11, // magic number
+			ConfState: pb.ConfState{Nodes: []uint64{1, 2}, Learners: []uint64{3}},
+		},
+	}
+
+	storage := NewMemoryStorage()
+	sm := newTestRaft(3, []uint64{1, 2, 3}, 10, 1, storage)
+
+	if sm.isLearner {
+		t.Errorf("%x is learner, want not", sm.id)
+	}
+	if ok := sm.restore(s); ok {
+		t.Error("restore succeed, want fail")
+	}
+}
+
+// TestRestoreLearnerPromotion checks that a learner can become to a follower after
+// restoring snapshot.
+func TestRestoreLearnerPromotion(t *testing.T) {
+	s := pb.Snapshot{
+		Metadata: pb.SnapshotMetadata{
+			Index:     11, // magic number
+			Term:      11, // magic number
+			ConfState: pb.ConfState{Nodes: []uint64{1, 2, 3}},
+		},
+	}
+
+	storage := NewMemoryStorage()
+	sm := newTestLearnerRaft(3, []uint64{1, 2}, []uint64{3}, 10, 1, storage)
+
+	if !sm.isLearner {
+		t.Errorf("%x is not learner, want yes", sm.id)
+	}
+
+	if ok := sm.restore(s); !ok {
+		t.Error("restore fail, want succeed")
+	}
+
+	if sm.isLearner {
+		t.Errorf("%x is learner, want not", sm.id)
+	}
+}
+
+// TestLearnerReceiveSnapshot tests that a learner can receive a snpahost from leader
+func TestLearnerReceiveSnapshot(t *testing.T) {
+	// restore the state machine from a snapshot so it has a compacted log and a snapshot
+	s := pb.Snapshot{
+		Metadata: pb.SnapshotMetadata{
+			Index:     11, // magic number
+			Term:      11, // magic number
+			ConfState: pb.ConfState{Nodes: []uint64{1}, Learners: []uint64{2}},
+		},
+	}
+
+	n1 := newTestLearnerRaft(1, []uint64{1}, []uint64{2}, 10, 1, NewMemoryStorage())
+	n2 := newTestLearnerRaft(2, []uint64{1}, []uint64{2}, 10, 1, NewMemoryStorage())
+
+	n1.restore(s)
+
+	// Force set n1 appplied index.
+	n1.raftLog.appliedTo(n1.raftLog.committed)
+
+	nt := newNetwork(n1, n2)
+
+	setRandomizedElectionTimeout(n1, n1.electionTimeout)
+	for i := 0; i < n1.electionTimeout; i++ {
+		n1.tick()
+	}
+
+	nt.send(pb.Message{From: 1, To: 1, Type: pb.MsgBeat})
+
+	if n2.raftLog.committed != n1.raftLog.committed {
+		t.Errorf("peer 2 must commit to %d, but %d", n1.raftLog.committed, n2.raftLog.committed)
+	}
+}
+
 func TestRestoreIgnoreSnapshot(t *testing.T) {
 	previousEnts := []pb.Entry{{Term: 1, Index: 1}, {Term: 1, Index: 2}, {Term: 1, Index: 3}}
 	commit := uint64(1)
@@ -2482,8 +3005,8 @@ func TestStepConfig(t *testing.T) {
 	if g := r.raftLog.lastIndex(); g != index+1 {
 		t.Errorf("index = %d, want %d", g, index+1)
 	}
-	if !r.pendingConf {
-		t.Errorf("pendingConf = %v, want true", r.pendingConf)
+	if r.pendingConfIndex != index+1 {
+		t.Errorf("pendingConfIndex = %d, want %d", r.pendingConfIndex, index+1)
 	}
 }
 
@@ -2497,7 +3020,7 @@ func TestStepIgnoreConfig(t *testing.T) {
 	r.becomeLeader()
 	r.Step(pb.Message{From: 1, To: 1, Type: pb.MsgProp, Entries: []pb.Entry{{Type: pb.EntryConfChange}}})
 	index := r.raftLog.lastIndex()
-	pendingConf := r.pendingConf
+	pendingConfIndex := r.pendingConfIndex
 	r.Step(pb.Message{From: 1, To: 1, Type: pb.MsgProp, Entries: []pb.Entry{{Type: pb.EntryConfChange}}})
 	wents := []pb.Entry{{Type: pb.EntryNormal, Term: 1, Index: 3, Data: nil}}
 	ents, err := r.raftLog.entries(index+1, noLimit)
@@ -2507,57 +3030,39 @@ func TestStepIgnoreConfig(t *testing.T) {
 	if !reflect.DeepEqual(ents, wents) {
 		t.Errorf("ents = %+v, want %+v", ents, wents)
 	}
-	if r.pendingConf != pendingConf {
-		t.Errorf("pendingConf = %v, want %v", r.pendingConf, pendingConf)
+	if r.pendingConfIndex != pendingConfIndex {
+		t.Errorf("pendingConfIndex = %d, want %d", r.pendingConfIndex, pendingConfIndex)
 	}
 }
 
-// TestRecoverPendingConfig tests that new leader recovers its pendingConf flag
+// TestNewLeaderPendingConfig tests that new leader sets its pendingConfigIndex
 // based on uncommitted entries.
-func TestRecoverPendingConfig(t *testing.T) {
+func TestNewLeaderPendingConfig(t *testing.T) {
 	tests := []struct {
-		entType  pb.EntryType
-		wpending bool
+		addEntry      bool
+		wpendingIndex uint64
 	}{
-		{pb.EntryNormal, false},
-		{pb.EntryConfChange, true},
+		{false, 0},
+		{true, 1},
 	}
 	for i, tt := range tests {
 		r := newTestRaft(1, []uint64{1, 2}, 10, 1, NewMemoryStorage())
-		r.appendEntry(pb.Entry{Type: tt.entType})
+		if tt.addEntry {
+			r.appendEntry(pb.Entry{Type: pb.EntryNormal})
+		}
 		r.becomeCandidate()
 		r.becomeLeader()
-		if r.pendingConf != tt.wpending {
-			t.Errorf("#%d: pendingConf = %v, want %v", i, r.pendingConf, tt.wpending)
+		if r.pendingConfIndex != tt.wpendingIndex {
+			t.Errorf("#%d: pendingConfIndex = %d, want %d",
+				i, r.pendingConfIndex, tt.wpendingIndex)
 		}
 	}
 }
 
-// TestRecoverDoublePendingConfig tests that new leader will panic if
-// there exist two uncommitted config entries.
-func TestRecoverDoublePendingConfig(t *testing.T) {
-	func() {
-		defer func() {
-			if err := recover(); err == nil {
-				t.Errorf("expect panic, but nothing happens")
-			}
-		}()
-		r := newTestRaft(1, []uint64{1, 2}, 10, 1, NewMemoryStorage())
-		r.appendEntry(pb.Entry{Type: pb.EntryConfChange})
-		r.appendEntry(pb.Entry{Type: pb.EntryConfChange})
-		r.becomeCandidate()
-		r.becomeLeader()
-	}()
-}
-
-// TestAddNode tests that addNode could update pendingConf and nodes correctly.
+// TestAddNode tests that addNode could update nodes correctly.
 func TestAddNode(t *testing.T) {
 	r := newTestRaft(1, []uint64{1}, 10, 1, NewMemoryStorage())
-	r.pendingConf = true
 	r.addNode(2)
-	if r.pendingConf {
-		t.Errorf("pendingConf = %v, want false", r.pendingConf)
-	}
 	nodes := r.nodes()
 	wnodes := []uint64{1, 2}
 	if !reflect.DeepEqual(nodes, wnodes) {
@@ -2565,15 +3070,59 @@ func TestAddNode(t *testing.T) {
 	}
 }
 
-// TestRemoveNode tests that removeNode could update pendingConf, nodes and
+// TestAddLearner tests that addLearner could update nodes correctly.
+func TestAddLearner(t *testing.T) {
+	r := newTestRaft(1, []uint64{1}, 10, 1, NewMemoryStorage())
+	r.addLearner(2)
+	nodes := r.learnerNodes()
+	wnodes := []uint64{2}
+	if !reflect.DeepEqual(nodes, wnodes) {
+		t.Errorf("nodes = %v, want %v", nodes, wnodes)
+	}
+	if !r.learnerPrs[2].IsLearner {
+		t.Errorf("node 2 is learner %t, want %t", r.prs[2].IsLearner, true)
+	}
+}
+
+// TestAddNodeCheckQuorum tests that addNode does not trigger a leader election
+// immediately when checkQuorum is set.
+func TestAddNodeCheckQuorum(t *testing.T) {
+	r := newTestRaft(1, []uint64{1}, 10, 1, NewMemoryStorage())
+	r.checkQuorum = true
+
+	r.becomeCandidate()
+	r.becomeLeader()
+
+	for i := 0; i < r.electionTimeout-1; i++ {
+		r.tick()
+	}
+
+	r.addNode(2)
+
+	// This tick will reach electionTimeout, which triggers a quorum check.
+	r.tick()
+
+	// Node 1 should still be the leader after a single tick.
+	if r.state != StateLeader {
+		t.Errorf("state = %v, want %v", r.state, StateLeader)
+	}
+
+	// After another electionTimeout ticks without hearing from node 2,
+	// node 1 should step down.
+	for i := 0; i < r.electionTimeout; i++ {
+		r.tick()
+	}
+
+	if r.state != StateFollower {
+		t.Errorf("state = %v, want %v", r.state, StateFollower)
+	}
+}
+
+// TestRemoveNode tests that removeNode could update nodes and
 // and removed list correctly.
 func TestRemoveNode(t *testing.T) {
 	r := newTestRaft(1, []uint64{1, 2}, 10, 1, NewMemoryStorage())
-	r.pendingConf = true
 	r.removeNode(2)
-	if r.pendingConf {
-		t.Errorf("pendingConf = %v, want false", r.pendingConf)
-	}
 	w := []uint64{1}
 	if g := r.nodes(); !reflect.DeepEqual(g, w) {
 		t.Errorf("nodes = %v, want %v", g, w)
@@ -2587,6 +3136,27 @@ func TestRemoveNode(t *testing.T) {
 	}
 }
 
+// TestRemoveLearner tests that removeNode could update nodes and
+// and removed list correctly.
+func TestRemoveLearner(t *testing.T) {
+	r := newTestLearnerRaft(1, []uint64{1}, []uint64{2}, 10, 1, NewMemoryStorage())
+	r.removeNode(2)
+	w := []uint64{1}
+	if g := r.nodes(); !reflect.DeepEqual(g, w) {
+		t.Errorf("nodes = %v, want %v", g, w)
+	}
+
+	w = []uint64{}
+	if g := r.learnerNodes(); !reflect.DeepEqual(g, w) {
+		t.Errorf("nodes = %v, want %v", g, w)
+	}
+
+	// remove all nodes from cluster
+	r.removeNode(1)
+	if g := r.nodes(); !reflect.DeepEqual(g, w) {
+		t.Errorf("nodes = %v, want %v", g, w)
+	}
+}
 func TestPromotable(t *testing.T) {
 	id := uint64(1)
 	tests := []struct {
@@ -2922,6 +3492,10 @@ func TestLeaderTransferIgnoreProposal(t *testing.T) {
 	}
 
 	nt.send(pb.Message{From: 1, To: 1, Type: pb.MsgProp, Entries: []pb.Entry{{}}})
+	err := lead.Step(pb.Message{From: 1, To: 1, Type: pb.MsgProp, Entries: []pb.Entry{{}}})
+	if err != ErrProposalDropped {
+		t.Fatalf("should return drop proposal error while transferring")
+	}
 
 	if lead.prs[1].Match != 1 {
 		t.Fatalf("node 1 has match %x, want %x", lead.prs[1].Match, 1)
@@ -3059,6 +3633,325 @@ func TestTransferNonMember(t *testing.T) {
 	}
 }
 
+// TestNodeWithSmallerTermCanCompleteElection tests the scenario where a node
+// that has been partitioned away (and fallen behind) rejoins the cluster at
+// about the same time the leader node gets partitioned away.
+// Previously the cluster would come to a standstill when run with PreVote
+// enabled.
+func TestNodeWithSmallerTermCanCompleteElection(t *testing.T) {
+	n1 := newTestRaft(1, []uint64{1, 2, 3}, 10, 1, NewMemoryStorage())
+	n2 := newTestRaft(2, []uint64{1, 2, 3}, 10, 1, NewMemoryStorage())
+	n3 := newTestRaft(3, []uint64{1, 2, 3}, 10, 1, NewMemoryStorage())
+
+	n1.becomeFollower(1, None)
+	n2.becomeFollower(1, None)
+	n3.becomeFollower(1, None)
+
+	n1.preVote = true
+	n2.preVote = true
+	n3.preVote = true
+
+	// cause a network partition to isolate node 3
+	nt := newNetwork(n1, n2, n3)
+	nt.cut(1, 3)
+	nt.cut(2, 3)
+
+	nt.send(pb.Message{From: 1, To: 1, Type: pb.MsgHup})
+
+	sm := nt.peers[1].(*raft)
+	if sm.state != StateLeader {
+		t.Errorf("peer 1 state: %s, want %s", sm.state, StateLeader)
+	}
+
+	sm = nt.peers[2].(*raft)
+	if sm.state != StateFollower {
+		t.Errorf("peer 2 state: %s, want %s", sm.state, StateFollower)
+	}
+
+	nt.send(pb.Message{From: 3, To: 3, Type: pb.MsgHup})
+	sm = nt.peers[3].(*raft)
+	if sm.state != StatePreCandidate {
+		t.Errorf("peer 3 state: %s, want %s", sm.state, StatePreCandidate)
+	}
+
+	nt.send(pb.Message{From: 2, To: 2, Type: pb.MsgHup})
+
+	// check whether the term values are expected
+	// a.Term == 3
+	// b.Term == 3
+	// c.Term == 1
+	sm = nt.peers[1].(*raft)
+	if sm.Term != 3 {
+		t.Errorf("peer 1 term: %d, want %d", sm.Term, 3)
+	}
+
+	sm = nt.peers[2].(*raft)
+	if sm.Term != 3 {
+		t.Errorf("peer 2 term: %d, want %d", sm.Term, 3)
+	}
+
+	sm = nt.peers[3].(*raft)
+	if sm.Term != 1 {
+		t.Errorf("peer 3 term: %d, want %d", sm.Term, 1)
+	}
+
+	// check state
+	// a == follower
+	// b == leader
+	// c == pre-candidate
+	sm = nt.peers[1].(*raft)
+	if sm.state != StateFollower {
+		t.Errorf("peer 1 state: %s, want %s", sm.state, StateFollower)
+	}
+	sm = nt.peers[2].(*raft)
+	if sm.state != StateLeader {
+		t.Errorf("peer 2 state: %s, want %s", sm.state, StateLeader)
+	}
+	sm = nt.peers[3].(*raft)
+	if sm.state != StatePreCandidate {
+		t.Errorf("peer 3 state: %s, want %s", sm.state, StatePreCandidate)
+	}
+
+	sm.logger.Infof("going to bring back peer 3 and kill peer 2")
+	// recover the network then immediately isolate b which is currently
+	// the leader, this is to emulate the crash of b.
+	nt.recover()
+	nt.cut(2, 1)
+	nt.cut(2, 3)
+
+	// call for election
+	nt.send(pb.Message{From: 3, To: 3, Type: pb.MsgHup})
+	nt.send(pb.Message{From: 1, To: 1, Type: pb.MsgHup})
+
+	// do we have a leader?
+	sma := nt.peers[1].(*raft)
+	smb := nt.peers[3].(*raft)
+	if sma.state != StateLeader && smb.state != StateLeader {
+		t.Errorf("no leader")
+	}
+}
+
+// TestPreVoteWithSplitVote verifies that after split vote, cluster can complete
+// election in next round.
+func TestPreVoteWithSplitVote(t *testing.T) {
+	n1 := newTestRaft(1, []uint64{1, 2, 3}, 10, 1, NewMemoryStorage())
+	n2 := newTestRaft(2, []uint64{1, 2, 3}, 10, 1, NewMemoryStorage())
+	n3 := newTestRaft(3, []uint64{1, 2, 3}, 10, 1, NewMemoryStorage())
+
+	n1.becomeFollower(1, None)
+	n2.becomeFollower(1, None)
+	n3.becomeFollower(1, None)
+
+	n1.preVote = true
+	n2.preVote = true
+	n3.preVote = true
+
+	nt := newNetwork(n1, n2, n3)
+	nt.send(pb.Message{From: 1, To: 1, Type: pb.MsgHup})
+
+	// simulate leader down. followers start split vote.
+	nt.isolate(1)
+	nt.send([]pb.Message{
+		{From: 2, To: 2, Type: pb.MsgHup},
+		{From: 3, To: 3, Type: pb.MsgHup},
+	}...)
+
+	// check whether the term values are expected
+	// n2.Term == 3
+	// n3.Term == 3
+	sm := nt.peers[2].(*raft)
+	if sm.Term != 3 {
+		t.Errorf("peer 2 term: %d, want %d", sm.Term, 3)
+	}
+	sm = nt.peers[3].(*raft)
+	if sm.Term != 3 {
+		t.Errorf("peer 3 term: %d, want %d", sm.Term, 3)
+	}
+
+	// check state
+	// n2 == candidate
+	// n3 == candidate
+	sm = nt.peers[2].(*raft)
+	if sm.state != StateCandidate {
+		t.Errorf("peer 2 state: %s, want %s", sm.state, StateCandidate)
+	}
+	sm = nt.peers[3].(*raft)
+	if sm.state != StateCandidate {
+		t.Errorf("peer 3 state: %s, want %s", sm.state, StateCandidate)
+	}
+
+	// node 2 election timeout first
+	nt.send(pb.Message{From: 2, To: 2, Type: pb.MsgHup})
+
+	// check whether the term values are expected
+	// n2.Term == 4
+	// n3.Term == 4
+	sm = nt.peers[2].(*raft)
+	if sm.Term != 4 {
+		t.Errorf("peer 2 term: %d, want %d", sm.Term, 4)
+	}
+	sm = nt.peers[3].(*raft)
+	if sm.Term != 4 {
+		t.Errorf("peer 3 term: %d, want %d", sm.Term, 4)
+	}
+
+	// check state
+	// n2 == leader
+	// n3 == follower
+	sm = nt.peers[2].(*raft)
+	if sm.state != StateLeader {
+		t.Errorf("peer 2 state: %s, want %s", sm.state, StateLeader)
+	}
+	sm = nt.peers[3].(*raft)
+	if sm.state != StateFollower {
+		t.Errorf("peer 3 state: %s, want %s", sm.state, StateFollower)
+	}
+}
+
+// simulate rolling update a cluster for Pre-Vote. cluster has 3 nodes [n1, n2, n3].
+// n1 is leader with term 2
+// n2 is follower with term 2
+// n3 is partitioned, with term 4 and less log, state is candidate
+func newPreVoteMigrationCluster(t *testing.T) *network {
+	n1 := newTestRaft(1, []uint64{1, 2, 3}, 10, 1, NewMemoryStorage())
+	n2 := newTestRaft(2, []uint64{1, 2, 3}, 10, 1, NewMemoryStorage())
+	n3 := newTestRaft(3, []uint64{1, 2, 3}, 10, 1, NewMemoryStorage())
+
+	n1.becomeFollower(1, None)
+	n2.becomeFollower(1, None)
+	n3.becomeFollower(1, None)
+
+	n1.preVote = true
+	n2.preVote = true
+	// We intentionally do not enable PreVote for n3, this is done so in order
+	// to simulate a rolling restart process where it's possible to have a mixed
+	// version cluster with replicas with PreVote enabled, and replicas without.
+
+	nt := newNetwork(n1, n2, n3)
+	nt.send(pb.Message{From: 1, To: 1, Type: pb.MsgHup})
+
+	// Cause a network partition to isolate n3.
+	nt.isolate(3)
+	nt.send(pb.Message{From: 1, To: 1, Type: pb.MsgProp, Entries: []pb.Entry{{Data: []byte("some data")}}})
+	nt.send(pb.Message{From: 3, To: 3, Type: pb.MsgHup})
+	nt.send(pb.Message{From: 3, To: 3, Type: pb.MsgHup})
+
+	// check state
+	// n1.state == StateLeader
+	// n2.state == StateFollower
+	// n3.state == StateCandidate
+	if n1.state != StateLeader {
+		t.Fatalf("node 1 state: %s, want %s", n1.state, StateLeader)
+	}
+	if n2.state != StateFollower {
+		t.Fatalf("node 2 state: %s, want %s", n2.state, StateFollower)
+	}
+	if n3.state != StateCandidate {
+		t.Fatalf("node 3 state: %s, want %s", n3.state, StateCandidate)
+	}
+
+	// check term
+	// n1.Term == 2
+	// n2.Term == 2
+	// n3.Term == 4
+	if n1.Term != 2 {
+		t.Fatalf("node 1 term: %d, want %d", n1.Term, 2)
+	}
+	if n2.Term != 2 {
+		t.Fatalf("node 2 term: %d, want %d", n2.Term, 2)
+	}
+	if n3.Term != 4 {
+		t.Fatalf("node 3 term: %d, want %d", n3.Term, 4)
+	}
+
+	// Enable prevote on n3, then recover the network
+	n3.preVote = true
+	nt.recover()
+
+	return nt
+}
+
+func TestPreVoteMigrationCanCompleteElection(t *testing.T) {
+	nt := newPreVoteMigrationCluster(t)
+
+	// n1 is leader with term 2
+	// n2 is follower with term 2
+	// n3 is pre-candidate with term 4, and less log
+	n2 := nt.peers[2].(*raft)
+	n3 := nt.peers[3].(*raft)
+
+	// simulate leader down
+	nt.isolate(1)
+
+	// Call for elections from both n2 and n3.
+	nt.send(pb.Message{From: 3, To: 3, Type: pb.MsgHup})
+	nt.send(pb.Message{From: 2, To: 2, Type: pb.MsgHup})
+
+	// check state
+	// n2.state == Follower
+	// n3.state == PreCandidate
+	if n2.state != StateFollower {
+		t.Errorf("node 2 state: %s, want %s", n2.state, StateFollower)
+	}
+	if n3.state != StatePreCandidate {
+		t.Errorf("node 3 state: %s, want %s", n3.state, StatePreCandidate)
+	}
+
+	nt.send(pb.Message{From: 3, To: 3, Type: pb.MsgHup})
+	nt.send(pb.Message{From: 2, To: 2, Type: pb.MsgHup})
+
+	// Do we have a leader?
+	if n2.state != StateLeader && n3.state != StateFollower {
+		t.Errorf("no leader")
+	}
+}
+
+func TestPreVoteMigrationWithFreeStuckPreCandidate(t *testing.T) {
+	nt := newPreVoteMigrationCluster(t)
+
+	// n1 is leader with term 2
+	// n2 is follower with term 2
+	// n3 is pre-candidate with term 4, and less log
+	n1 := nt.peers[1].(*raft)
+	n2 := nt.peers[2].(*raft)
+	n3 := nt.peers[3].(*raft)
+
+	nt.send(pb.Message{From: 3, To: 3, Type: pb.MsgHup})
+
+	if n1.state != StateLeader {
+		t.Errorf("node 1 state: %s, want %s", n1.state, StateLeader)
+	}
+	if n2.state != StateFollower {
+		t.Errorf("node 2 state: %s, want %s", n2.state, StateFollower)
+	}
+	if n3.state != StatePreCandidate {
+		t.Errorf("node 3 state: %s, want %s", n3.state, StatePreCandidate)
+	}
+
+	// Pre-Vote again for safety
+	nt.send(pb.Message{From: 3, To: 3, Type: pb.MsgHup})
+
+	if n1.state != StateLeader {
+		t.Errorf("node 1 state: %s, want %s", n1.state, StateLeader)
+	}
+	if n2.state != StateFollower {
+		t.Errorf("node 2 state: %s, want %s", n2.state, StateFollower)
+	}
+	if n3.state != StatePreCandidate {
+		t.Errorf("node 3 state: %s, want %s", n3.state, StatePreCandidate)
+	}
+
+	nt.send(pb.Message{From: 1, To: 3, Type: pb.MsgHeartbeat, Term: n1.Term})
+
+	// Disrupt the leader so that the stuck peer is freed
+	if n1.state != StateFollower {
+		t.Errorf("state = %s, want %s", n1.state, StateFollower)
+	}
+	if n3.Term != n1.Term {
+		t.Errorf("term = %d, want %d", n3.Term, n1.Term)
+	}
+}
+
 func entsWithConfig(configFunc func(*Config), terms ...uint64) *raft {
 	storage := NewMemoryStorage()
 	for i, term := range terms {
@@ -3124,10 +4017,19 @@ func newNetworkWithConfig(configFunc func(*Config), peers ...stateMachine) *netw
 			sm := newRaft(cfg)
 			npeers[id] = sm
 		case *raft:
+			learners := make(map[uint64]bool, len(v.learnerPrs))
+			for i := range v.learnerPrs {
+				learners[i] = true
+			}
 			v.id = id
 			v.prs = make(map[uint64]*Progress)
+			v.learnerPrs = make(map[uint64]*Progress)
 			for i := 0; i < size; i++ {
-				v.prs[peerAddrs[i]] = &Progress{}
+				if _, ok := learners[peerAddrs[i]]; ok {
+					v.learnerPrs[peerAddrs[i]] = &Progress{IsLearner: true}
+				} else {
+					v.prs[peerAddrs[i]] = &Progress{}
+				}
 			}
 			v.reset(v.Term)
 			npeers[id] = v
@@ -3163,16 +4065,16 @@ func (nw *network) drop(from, to uint64, perc float64) {
 }
 
 func (nw *network) cut(one, other uint64) {
-	nw.drop(one, other, 1)
-	nw.drop(other, one, 1)
+	nw.drop(one, other, 2.0) // always drop
+	nw.drop(other, one, 2.0) // always drop
 }
 
 func (nw *network) isolate(id uint64) {
 	for i := 0; i < len(nw.peers); i++ {
 		nid := uint64(i) + 1
 		if nid != id {
-			nw.drop(id, nid, 1.0)
-			nw.drop(nid, id, 1.0)
+			nw.drop(id, nid, 1.0) // always drop
+			nw.drop(nid, id, 1.0) // always drop
 		}
 	}
 }
@@ -3247,4 +4149,10 @@ func newTestConfig(id uint64, peers []uint64, election, heartbeat int, storage S
 
 func newTestRaft(id uint64, peers []uint64, election, heartbeat int, storage Storage) *raft {
 	return newRaft(newTestConfig(id, peers, election, heartbeat, storage))
+}
+
+func newTestLearnerRaft(id uint64, peers []uint64, learners []uint64, election, heartbeat int, storage Storage) *raft {
+	cfg := newTestConfig(id, peers, election, heartbeat, storage)
+	cfg.learners = learners
+	return newRaft(cfg)
 }

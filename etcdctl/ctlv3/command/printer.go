@@ -20,9 +20,10 @@ import (
 	"strings"
 
 	v3 "github.com/coreos/etcd/clientv3"
-	"github.com/dustin/go-humanize"
-
+	"github.com/coreos/etcd/clientv3/snapshot"
 	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
+
+	"github.com/dustin/go-humanize"
 )
 
 type printer interface {
@@ -32,17 +33,24 @@ type printer interface {
 	Txn(v3.TxnResponse)
 	Watch(v3.WatchResponse)
 
+	Grant(r v3.LeaseGrantResponse)
+	Revoke(id v3.LeaseID, r v3.LeaseRevokeResponse)
+	KeepAlive(r v3.LeaseKeepAliveResponse)
 	TimeToLive(r v3.LeaseTimeToLiveResponse, keys bool)
+	Leases(r v3.LeaseLeasesResponse)
 
 	MemberAdd(v3.MemberAddResponse)
 	MemberRemove(id uint64, r v3.MemberRemoveResponse)
 	MemberUpdate(id uint64, r v3.MemberUpdateResponse)
 	MemberList(v3.MemberListResponse)
 
+	EndpointHealth([]epHealth)
 	EndpointStatus([]epStatus)
+	EndpointHashKV([]epHashKV)
+	MoveLeader(leader, target uint64, r v3.MoveLeaderResponse)
 
 	Alarm(v3.AlarmResponse)
-	DBStatus(dbstatus)
+	DBStatus(snapshot.Status)
 
 	RoleAdd(role string, r v3.AuthRoleAddResponse)
 	RoleGet(role string, r v3.AuthRoleGetResponse)
@@ -81,13 +89,19 @@ type printerRPC struct {
 	p func(interface{})
 }
 
-func (p *printerRPC) Del(r v3.DeleteResponse)                            { p.p((*pb.DeleteRangeResponse)(&r)) }
-func (p *printerRPC) Get(r v3.GetResponse)                               { p.p((*pb.RangeResponse)(&r)) }
-func (p *printerRPC) Put(r v3.PutResponse)                               { p.p((*pb.PutResponse)(&r)) }
-func (p *printerRPC) Txn(r v3.TxnResponse)                               { p.p((*pb.TxnResponse)(&r)) }
-func (p *printerRPC) Watch(r v3.WatchResponse)                           { p.p(&r) }
+func (p *printerRPC) Del(r v3.DeleteResponse)  { p.p((*pb.DeleteRangeResponse)(&r)) }
+func (p *printerRPC) Get(r v3.GetResponse)     { p.p((*pb.RangeResponse)(&r)) }
+func (p *printerRPC) Put(r v3.PutResponse)     { p.p((*pb.PutResponse)(&r)) }
+func (p *printerRPC) Txn(r v3.TxnResponse)     { p.p((*pb.TxnResponse)(&r)) }
+func (p *printerRPC) Watch(r v3.WatchResponse) { p.p(&r) }
+
+func (p *printerRPC) Grant(r v3.LeaseGrantResponse)                      { p.p(r) }
+func (p *printerRPC) Revoke(id v3.LeaseID, r v3.LeaseRevokeResponse)     { p.p(r) }
+func (p *printerRPC) KeepAlive(r v3.LeaseKeepAliveResponse)              { p.p(r) }
 func (p *printerRPC) TimeToLive(r v3.LeaseTimeToLiveResponse, keys bool) { p.p(&r) }
-func (p *printerRPC) MemberAdd(r v3.MemberAddResponse)                   { p.p((*pb.MemberAddResponse)(&r)) }
+func (p *printerRPC) Leases(r v3.LeaseLeasesResponse)                    { p.p(&r) }
+
+func (p *printerRPC) MemberAdd(r v3.MemberAddResponse) { p.p((*pb.MemberAddResponse)(&r)) }
 func (p *printerRPC) MemberRemove(id uint64, r v3.MemberRemoveResponse) {
 	p.p((*pb.MemberRemoveResponse)(&r))
 }
@@ -96,7 +110,9 @@ func (p *printerRPC) MemberUpdate(id uint64, r v3.MemberUpdateResponse) {
 }
 func (p *printerRPC) MemberList(r v3.MemberListResponse) { p.p((*pb.MemberListResponse)(&r)) }
 func (p *printerRPC) Alarm(r v3.AlarmResponse)           { p.p((*pb.AlarmResponse)(&r)) }
-
+func (p *printerRPC) MoveLeader(leader, target uint64, r v3.MoveLeaderResponse) {
+	p.p((*pb.MoveLeaderResponse)(&r))
+}
 func (p *printerRPC) RoleAdd(_ string, r v3.AuthRoleAddResponse) { p.p((*pb.AuthRoleAddResponse)(&r)) }
 func (p *printerRPC) RoleGet(_ string, r v3.AuthRoleGetResponse) { p.p((*pb.AuthRoleGetResponse)(&r)) }
 func (p *printerRPC) RoleDelete(_ string, r v3.AuthRoleDeleteResponse) {
@@ -134,8 +150,12 @@ func newPrinterUnsupported(n string) printer {
 	return &printerUnsupported{printerRPC{nil, f}}
 }
 
+func (p *printerUnsupported) EndpointHealth([]epHealth) { p.p(nil) }
 func (p *printerUnsupported) EndpointStatus([]epStatus) { p.p(nil) }
-func (p *printerUnsupported) DBStatus(dbstatus)         { p.p(nil) }
+func (p *printerUnsupported) EndpointHashKV([]epHashKV) { p.p(nil) }
+func (p *printerUnsupported) DBStatus(snapshot.Status)  { p.p(nil) }
+
+func (p *printerUnsupported) MoveLeader(leader, target uint64, r v3.MoveLeaderResponse) { p.p(nil) }
 
 func makeMemberListTable(r v3.MemberListResponse) (hdr []string, rows [][]string) {
 	hdr = []string{"ID", "Status", "Name", "Peer Addrs", "Client Addrs"}
@@ -152,26 +172,52 @@ func makeMemberListTable(r v3.MemberListResponse) (hdr []string, rows [][]string
 			strings.Join(m.ClientURLs, ","),
 		})
 	}
-	return
+	return hdr, rows
+}
+
+func makeEndpointHealthTable(healthList []epHealth) (hdr []string, rows [][]string) {
+	hdr = []string{"endpoint", "health", "took", "error"}
+	for _, h := range healthList {
+		rows = append(rows, []string{
+			h.Ep,
+			fmt.Sprintf("%v", h.Health),
+			h.Took,
+			h.Error,
+		})
+	}
+	return hdr, rows
 }
 
 func makeEndpointStatusTable(statusList []epStatus) (hdr []string, rows [][]string) {
-	hdr = []string{"endpoint", "ID", "version", "db size", "is leader", "raft term", "raft index"}
+	hdr = []string{"endpoint", "ID", "version", "db size", "is leader", "raft term", "raft index", "raft applied index", "errors"}
 	for _, status := range statusList {
 		rows = append(rows, []string{
-			fmt.Sprint(status.Ep),
+			status.Ep,
 			fmt.Sprintf("%x", status.Resp.Header.MemberId),
-			fmt.Sprint(status.Resp.Version),
-			fmt.Sprint(humanize.Bytes(uint64(status.Resp.DbSize))),
+			status.Resp.Version,
+			humanize.Bytes(uint64(status.Resp.DbSize)),
 			fmt.Sprint(status.Resp.Leader == status.Resp.Header.MemberId),
 			fmt.Sprint(status.Resp.RaftTerm),
 			fmt.Sprint(status.Resp.RaftIndex),
+			fmt.Sprint(status.Resp.RaftAppliedIndex),
+			fmt.Sprint(strings.Join(status.Resp.Errors, ", ")),
 		})
 	}
-	return
+	return hdr, rows
 }
 
-func makeDBStatusTable(ds dbstatus) (hdr []string, rows [][]string) {
+func makeEndpointHashKVTable(hashList []epHashKV) (hdr []string, rows [][]string) {
+	hdr = []string{"endpoint", "hash"}
+	for _, h := range hashList {
+		rows = append(rows, []string{
+			h.Ep,
+			fmt.Sprint(h.Resp.Hash),
+		})
+	}
+	return hdr, rows
+}
+
+func makeDBStatusTable(ds snapshot.Status) (hdr []string, rows [][]string) {
 	hdr = []string{"hash", "revision", "total keys", "total size"}
 	rows = append(rows, []string{
 		fmt.Sprintf("%x", ds.Hash),
@@ -179,5 +225,5 @@ func makeDBStatusTable(ds dbstatus) (hdr []string, rows [][]string) {
 		fmt.Sprint(ds.TotalKey),
 		humanize.Bytes(uint64(ds.TotalSize)),
 	})
-	return
+	return hdr, rows
 }

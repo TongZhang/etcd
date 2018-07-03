@@ -27,7 +27,7 @@
 //	unprefixedKV := cli.KV
 //	cli.KV = namespace.NewKV(cli.KV, "my-prefix/")
 //	cli.Watcher = namespace.NewWatcher(cli.Watcher, "my-prefix/")
-//	cli.Leases = namespace.NewLease(cli.Lease, "my-prefix/")
+//	cli.Lease = namespace.NewLease(cli.Lease, "my-prefix/")
 //
 // Now calls using 'cli' will namespace / prefix all keys with "my-prefix/":
 //
@@ -36,7 +36,7 @@
 //	fmt.Printf("%s\n", resp.Kvs[0].Value)
 //	// Output: 123
 //	unprefixedKV.Put(context.TODO(), "my-prefix/abc", "456")
-//	resp, _ = cli.Get("abc")
+//	resp, _ = cli.Get(context.TODO(), "abc")
 //	fmt.Printf("%s\n", resp.Kvs[0].Value)
 //	// Output: 456
 //

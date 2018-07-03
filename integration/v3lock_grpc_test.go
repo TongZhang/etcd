@@ -15,13 +15,13 @@
 package integration
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	lockpb "github.com/coreos/etcd/etcdserver/api/v3lock/v3lockpb"
 	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
 	"github.com/coreos/etcd/pkg/testutil"
-	"golang.org/x/net/context"
 )
 
 // TestV3LockLockWaiter tests that a client will wait for a lock, then acquire it
@@ -40,7 +40,7 @@ func TestV3LockLockWaiter(t *testing.T) {
 		t.Fatal(err2)
 	}
 
-	lc := lockpb.NewLockClient(clus.Client(0).ActiveConnection())
+	lc := toGRPC(clus.Client(0)).Lock
 	l1, lerr1 := lc.Lock(context.TODO(), &lockpb.LockRequest{Name: []byte("foo"), Lease: lease1.ID})
 	if lerr1 != nil {
 		t.Fatal(lerr1)

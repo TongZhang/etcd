@@ -15,20 +15,22 @@
 package v2http
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sort"
 	"testing"
 
-	etcdErr "github.com/coreos/etcd/error"
 	"github.com/coreos/etcd/etcdserver"
+	"github.com/coreos/etcd/etcdserver/api/membership"
+	"github.com/coreos/etcd/etcdserver/api/v2error"
 	"github.com/coreos/etcd/etcdserver/etcdserverpb"
-	"github.com/coreos/etcd/etcdserver/membership"
 	"github.com/coreos/etcd/pkg/types"
 	"github.com/coreos/etcd/raft/raftpb"
+
 	"github.com/coreos/go-semver/semver"
-	"golang.org/x/net/context"
+	"go.uber.org/zap"
 )
 
 type fakeCluster struct {
@@ -48,42 +50,36 @@ func (c *fakeCluster) Members() []*membership.Member {
 	return []*membership.Member(ms)
 }
 func (c *fakeCluster) Member(id types.ID) *membership.Member { return c.members[uint64(id)] }
-func (c *fakeCluster) IsIDRemoved(id types.ID) bool          { return false }
 func (c *fakeCluster) Version() *semver.Version              { return nil }
 
 // errServer implements the etcd.Server interface for testing.
 // It returns the given error from any Do/Process/AddMember/RemoveMember calls.
 type errServer struct {
 	err error
+	fakeServer
 }
 
-func (fs *errServer) Start()           {}
-func (fs *errServer) Stop()            {}
-func (fs *errServer) ID() types.ID     { return types.ID(1) }
-func (fs *errServer) Leader() types.ID { return types.ID(1) }
 func (fs *errServer) Do(ctx context.Context, r etcdserverpb.Request) (etcdserver.Response, error) {
 	return etcdserver.Response{}, fs.err
 }
 func (fs *errServer) Process(ctx context.Context, m raftpb.Message) error {
 	return fs.err
 }
-func (fs *errServer) AddMember(ctx context.Context, m membership.Member) error {
-	return fs.err
+func (fs *errServer) AddMember(ctx context.Context, m membership.Member) ([]*membership.Member, error) {
+	return nil, fs.err
 }
-func (fs *errServer) RemoveMember(ctx context.Context, id uint64) error {
-	return fs.err
+func (fs *errServer) RemoveMember(ctx context.Context, id uint64) ([]*membership.Member, error) {
+	return nil, fs.err
 }
-func (fs *errServer) UpdateMember(ctx context.Context, m membership.Member) error {
-	return fs.err
+func (fs *errServer) UpdateMember(ctx context.Context, m membership.Member) ([]*membership.Member, error) {
+	return nil, fs.err
 }
-
-func (fs *errServer) ClusterVersion() *semver.Version { return nil }
 
 func TestWriteError(t *testing.T) {
 	// nil error should not panic
 	rec := httptest.NewRecorder()
 	r := new(http.Request)
-	writeError(rec, r, nil)
+	writeError(zap.NewExample(), rec, r, nil)
 	h := rec.Header()
 	if len(h) > 0 {
 		t.Fatalf("unexpected non-empty headers: %#v", h)
@@ -99,12 +95,12 @@ func TestWriteError(t *testing.T) {
 		wi    string
 	}{
 		{
-			etcdErr.NewError(etcdErr.EcodeKeyNotFound, "/foo/bar", 123),
+			v2error.NewError(v2error.EcodeKeyNotFound, "/foo/bar", 123),
 			http.StatusNotFound,
 			"123",
 		},
 		{
-			etcdErr.NewError(etcdErr.EcodeTestFailed, "/foo/bar", 456),
+			v2error.NewError(v2error.EcodeTestFailed, "/foo/bar", 456),
 			http.StatusPreconditionFailed,
 			"456",
 		},
@@ -116,7 +112,7 @@ func TestWriteError(t *testing.T) {
 
 	for i, tt := range tests {
 		rw := httptest.NewRecorder()
-		writeError(rw, r, tt.err)
+		writeError(zap.NewExample(), rw, r, tt.err)
 		if code := rw.Code; code != tt.wcode {
 			t.Errorf("#%d: code=%d, want %d", i, code, tt.wcode)
 		}

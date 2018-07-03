@@ -16,7 +16,7 @@ package integration
 
 import (
 	"bytes"
-	"math/rand"
+	"context"
 	"os"
 	"reflect"
 	"strings"
@@ -28,8 +28,9 @@ import (
 	"github.com/coreos/etcd/integration"
 	"github.com/coreos/etcd/mvcc/mvccpb"
 	"github.com/coreos/etcd/pkg/testutil"
-	"golang.org/x/net/context"
+
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 )
 
 func TestKVPutError(t *testing.T) {
@@ -39,7 +40,7 @@ func TestKVPutError(t *testing.T) {
 		maxReqBytes = 1.5 * 1024 * 1024 // hard coded max in v3_server.go
 		quota       = int64(int(maxReqBytes) + 8*os.Getpagesize())
 	)
-	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1, QuotaBackendBytes: quota})
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1, QuotaBackendBytes: quota, ClientMaxCallSendMsgSize: 100 * 1024 * 1024})
 	defer clus.Terminate(t)
 
 	kv := clus.RandClient()
@@ -381,6 +382,36 @@ func TestKVRange(t *testing.T) {
 				{Key: []byte("fop"), Value: nil, CreateRevision: 9, ModRevision: 9, Version: 1},
 			},
 		},
+		// fetch entire keyspace using WithFromKey
+		{
+			"\x00", "",
+			0,
+			[]clientv3.OpOption{clientv3.WithFromKey(), clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend)},
+
+			[]*mvccpb.KeyValue{
+				{Key: []byte("a"), Value: nil, CreateRevision: 2, ModRevision: 2, Version: 1},
+				{Key: []byte("b"), Value: nil, CreateRevision: 3, ModRevision: 3, Version: 1},
+				{Key: []byte("c"), Value: nil, CreateRevision: 4, ModRevision: 6, Version: 3},
+				{Key: []byte("foo"), Value: nil, CreateRevision: 7, ModRevision: 7, Version: 1},
+				{Key: []byte("foo/abc"), Value: nil, CreateRevision: 8, ModRevision: 8, Version: 1},
+				{Key: []byte("fop"), Value: nil, CreateRevision: 9, ModRevision: 9, Version: 1},
+			},
+		},
+		// fetch entire keyspace using WithPrefix
+		{
+			"", "",
+			0,
+			[]clientv3.OpOption{clientv3.WithPrefix(), clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend)},
+
+			[]*mvccpb.KeyValue{
+				{Key: []byte("a"), Value: nil, CreateRevision: 2, ModRevision: 2, Version: 1},
+				{Key: []byte("b"), Value: nil, CreateRevision: 3, ModRevision: 3, Version: 1},
+				{Key: []byte("c"), Value: nil, CreateRevision: 4, ModRevision: 6, Version: 3},
+				{Key: []byte("foo"), Value: nil, CreateRevision: 7, ModRevision: 7, Version: 1},
+				{Key: []byte("foo/abc"), Value: nil, CreateRevision: 8, ModRevision: 8, Version: 1},
+				{Key: []byte("fop"), Value: nil, CreateRevision: 9, ModRevision: 9, Version: 1},
+			},
+		},
 	}
 
 	for i, tt := range tests {
@@ -411,8 +442,8 @@ func TestKVGetErrConnClosed(t *testing.T) {
 	go func() {
 		defer close(donec)
 		_, err := cli.Get(context.TODO(), "foo")
-		if err != nil && err != grpc.ErrClientConnClosing {
-			t.Fatalf("expected %v, got %v", grpc.ErrClientConnClosing, err)
+		if !clientv3.IsConnCanceled(err) {
+			t.Fatalf("expected %v or %v, got %v", context.Canceled, grpc.ErrClientConnClosing, err)
 		}
 	}()
 
@@ -422,7 +453,7 @@ func TestKVGetErrConnClosed(t *testing.T) {
 	clus.TakeClient(0)
 
 	select {
-	case <-time.After(3 * time.Second):
+	case <-time.After(integration.RequestWaitTimeout):
 		t.Fatal("kv.Get took too long")
 	case <-donec:
 	}
@@ -442,13 +473,14 @@ func TestKVNewAfterClose(t *testing.T) {
 
 	donec := make(chan struct{})
 	go func() {
-		if _, err := cli.Get(context.TODO(), "foo"); err != grpc.ErrClientConnClosing {
-			t.Fatalf("expected %v, got %v", grpc.ErrClientConnClosing, err)
+		_, err := cli.Get(context.TODO(), "foo")
+		if !clientv3.IsConnCanceled(err) {
+			t.Fatalf("expected %v or %v, got %v", context.Canceled, grpc.ErrClientConnClosing, err)
 		}
 		close(donec)
 	}()
 	select {
-	case <-time.After(3 * time.Second):
+	case <-time.After(integration.RequestWaitTimeout):
 		t.Fatal("kv.Get took too long")
 	case <-donec:
 	}
@@ -676,9 +708,10 @@ func TestKVGetRetry(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 	clus.Members[fIdx].Restart(t)
+	clus.Members[fIdx].WaitOK(t)
 
 	select {
-	case <-time.After(5 * time.Second):
+	case <-time.After(20 * time.Second):
 		t.Fatalf("timed out waiting for get")
 	case <-donec:
 	}
@@ -718,7 +751,7 @@ func TestKVPutFailGetRetry(t *testing.T) {
 	clus.Members[0].Restart(t)
 
 	select {
-	case <-time.After(5 * time.Second):
+	case <-time.After(20 * time.Second):
 		t.Fatalf("timed out waiting for get")
 	case <-donec:
 	}
@@ -760,7 +793,7 @@ func TestKVGetStoppedServerAndClose(t *testing.T) {
 	// this Get fails and triggers an asynchronous connection retry
 	_, err := cli.Get(ctx, "abc")
 	cancel()
-	if !strings.Contains(err.Error(), "context deadline") {
+	if err != nil && !(isCanceled(err) || isClientTimeout(err)) {
 		t.Fatal(err)
 	}
 }
@@ -782,86 +815,144 @@ func TestKVPutStoppedServerAndClose(t *testing.T) {
 	// grpc finds out the original connection is down due to the member shutdown.
 	_, err := cli.Get(ctx, "abc")
 	cancel()
-	if !strings.Contains(err.Error(), "context deadline") {
+	if err != nil && !(isCanceled(err) || isClientTimeout(err)) {
 		t.Fatal(err)
 	}
 
+	ctx, cancel = context.WithTimeout(context.TODO(), time.Second)
 	// this Put fails and triggers an asynchronous connection retry
 	_, err = cli.Put(ctx, "abc", "123")
 	cancel()
-	if !strings.Contains(err.Error(), "context deadline") {
+	if err != nil && !(isCanceled(err) || isClientTimeout(err) || isUnavailable(err)) {
 		t.Fatal(err)
 	}
 }
 
-// TestKVGetOneEndpointDown ensures a client can connect and get if one endpoint is down
-func TestKVPutOneEndpointDown(t *testing.T) {
+// TestKVPutAtMostOnce ensures that a Put will only occur at most once
+// in the presence of network errors.
+func TestKVPutAtMostOnce(t *testing.T) {
 	defer testutil.AfterTest(t)
-	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 3})
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
 	defer clus.Terminate(t)
 
-	// get endpoint list
-	eps := make([]string, 3)
-	for i := range eps {
-		eps[i] = clus.Members[i].GRPCAddr()
-	}
-
-	// make a dead node
-	clus.Members[rand.Intn(len(eps))].Stop(t)
-
-	// try to connect with dead node in the endpoint list
-	cfg := clientv3.Config{Endpoints: eps, DialTimeout: 1 * time.Second}
-	cli, err := clientv3.New(cfg)
-	if err != nil {
+	if _, err := clus.Client(0).Put(context.TODO(), "k", "1"); err != nil {
 		t.Fatal(err)
 	}
-	defer cli.Close()
-	ctx, cancel := context.WithTimeout(context.TODO(), 3*time.Second)
-	if _, err := cli.Get(ctx, "abc", clientv3.WithSerializable()); err != nil {
-		t.Fatal(err)
-	}
-	cancel()
-}
 
-// TestKVGetResetLoneEndpoint ensures that if an endpoint resets and all other
-// endpoints are down, then it will reconnect.
-func TestKVGetResetLoneEndpoint(t *testing.T) {
-	defer testutil.AfterTest(t)
-	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 2})
-	defer clus.Terminate(t)
-
-	// get endpoint list
-	eps := make([]string, 2)
-	for i := range eps {
-		eps[i] = clus.Members[i].GRPCAddr()
-	}
-
-	cfg := clientv3.Config{Endpoints: eps, DialTimeout: 500 * time.Millisecond}
-	cli, err := clientv3.New(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cli.Close()
-
-	// disconnect everything
-	clus.Members[0].Stop(t)
-	clus.Members[1].Stop(t)
-
-	// have Get try to reconnect
-	donec := make(chan struct{})
-	go func() {
-		ctx, cancel := context.WithTimeout(context.TODO(), 5*time.Second)
-		if _, err := cli.Get(ctx, "abc", clientv3.WithSerializable()); err != nil {
-			t.Fatal(err)
+	for i := 0; i < 10; i++ {
+		clus.Members[0].DropConnections()
+		donec := make(chan struct{})
+		go func() {
+			defer close(donec)
+			for i := 0; i < 10; i++ {
+				clus.Members[0].DropConnections()
+				time.Sleep(5 * time.Millisecond)
+			}
+		}()
+		_, err := clus.Client(0).Put(context.TODO(), "k", "v")
+		<-donec
+		if err != nil {
+			break
 		}
-		cancel()
-		close(donec)
-	}()
-	time.Sleep(500 * time.Millisecond)
-	clus.Members[0].Restart(t)
-	select {
-	case <-time.After(10 * time.Second):
-		t.Fatalf("timed out waiting for Get")
-	case <-donec:
+	}
+
+	resp, err := clus.Client(0).Get(context.TODO(), "k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Kvs[0].Version > 11 {
+		t.Fatalf("expected version <= 10, got %+v", resp.Kvs[0])
+	}
+}
+
+// TestKVLargeRequests tests various client/server side request limits.
+func TestKVLargeRequests(t *testing.T) {
+	defer testutil.AfterTest(t)
+	tests := []struct {
+		// make sure that "MaxCallSendMsgSize" < server-side default send/recv limit
+		maxRequestBytesServer  uint
+		maxCallSendBytesClient int
+		maxCallRecvBytesClient int
+
+		valueSize   int
+		expectError error
+	}{
+		{
+			maxRequestBytesServer:  1,
+			maxCallSendBytesClient: 0,
+			maxCallRecvBytesClient: 0,
+			valueSize:              1024,
+			expectError:            rpctypes.ErrRequestTooLarge,
+		},
+
+		// without proper client-side receive size limit
+		// "code = ResourceExhausted desc = grpc: received message larger than max (5242929 vs. 4194304)"
+		{
+
+			maxRequestBytesServer:  7*1024*1024 + 512*1024,
+			maxCallSendBytesClient: 7 * 1024 * 1024,
+			maxCallRecvBytesClient: 0,
+			valueSize:              5 * 1024 * 1024,
+			expectError:            nil,
+		},
+
+		{
+			maxRequestBytesServer:  10 * 1024 * 1024,
+			maxCallSendBytesClient: 100 * 1024 * 1024,
+			maxCallRecvBytesClient: 0,
+			valueSize:              10 * 1024 * 1024,
+			expectError:            rpctypes.ErrRequestTooLarge,
+		},
+		{
+			maxRequestBytesServer:  10 * 1024 * 1024,
+			maxCallSendBytesClient: 10 * 1024 * 1024,
+			maxCallRecvBytesClient: 0,
+			valueSize:              10 * 1024 * 1024,
+			expectError:            grpc.Errorf(codes.ResourceExhausted, "trying to send message larger than max "),
+		},
+		{
+			maxRequestBytesServer:  10 * 1024 * 1024,
+			maxCallSendBytesClient: 100 * 1024 * 1024,
+			maxCallRecvBytesClient: 0,
+			valueSize:              10*1024*1024 + 5,
+			expectError:            rpctypes.ErrRequestTooLarge,
+		},
+		{
+			maxRequestBytesServer:  10 * 1024 * 1024,
+			maxCallSendBytesClient: 10 * 1024 * 1024,
+			maxCallRecvBytesClient: 0,
+			valueSize:              10*1024*1024 + 5,
+			expectError:            grpc.Errorf(codes.ResourceExhausted, "trying to send message larger than max "),
+		},
+	}
+	for i, test := range tests {
+		clus := integration.NewClusterV3(t,
+			&integration.ClusterConfig{
+				Size:                     1,
+				MaxRequestBytes:          test.maxRequestBytesServer,
+				ClientMaxCallSendMsgSize: test.maxCallSendBytesClient,
+				ClientMaxCallRecvMsgSize: test.maxCallRecvBytesClient,
+			},
+		)
+		cli := clus.Client(0)
+		_, err := cli.Put(context.TODO(), "foo", strings.Repeat("a", test.valueSize))
+
+		if _, ok := err.(rpctypes.EtcdError); ok {
+			if err != test.expectError {
+				t.Errorf("#%d: expected %v, got %v", i, test.expectError, err)
+			}
+		} else if err != nil && !strings.HasPrefix(err.Error(), test.expectError.Error()) {
+			t.Errorf("#%d: expected error starting with '%s', got '%s'", i, test.expectError.Error(), err.Error())
+		}
+
+		// put request went through, now expects large response back
+		if err == nil {
+			_, err = cli.Get(context.TODO(), "foo")
+			if err != nil {
+				t.Errorf("#%d: get expected no error, got %v", i, err)
+			}
+		}
+
+		clus.Terminate(t)
 	}
 }

@@ -16,13 +16,14 @@ package raft
 
 import (
 	"bytes"
+	"context"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/coreos/etcd/pkg/testutil"
 	"github.com/coreos/etcd/raft/raftpb"
-	"golang.org/x/net/context"
 )
 
 // TestNodeStep ensures that node.Step sends msgProp to propc chan
@@ -30,7 +31,7 @@ import (
 func TestNodeStep(t *testing.T) {
 	for i, msgn := range raftpb.MessageType_name {
 		n := &node{
-			propc: make(chan raftpb.Message, 1),
+			propc: make(chan msgWithResult, 1),
 			recvc: make(chan raftpb.Message, 1),
 		}
 		msgt := raftpb.MessageType(i)
@@ -64,7 +65,7 @@ func TestNodeStep(t *testing.T) {
 func TestNodeStepUnblock(t *testing.T) {
 	// a node without buffer to block step
 	n := &node{
-		propc: make(chan raftpb.Message),
+		propc: make(chan msgWithResult),
 		done:  make(chan struct{}),
 	}
 
@@ -109,8 +110,9 @@ func TestNodeStepUnblock(t *testing.T) {
 // TestNodePropose ensures that node.Propose sends the given proposal to the underlying raft.
 func TestNodePropose(t *testing.T) {
 	msgs := []raftpb.Message{}
-	appendStep := func(r *raft, m raftpb.Message) {
+	appendStep := func(r *raft, m raftpb.Message) error {
 		msgs = append(msgs, m)
+		return nil
 	}
 
 	n := newNode()
@@ -147,8 +149,9 @@ func TestNodePropose(t *testing.T) {
 // It also ensures that ReadState can be read out through ready chan.
 func TestNodeReadIndex(t *testing.T) {
 	msgs := []raftpb.Message{}
-	appendStep := func(r *raft, m raftpb.Message) {
+	appendStep := func(r *raft, m raftpb.Message) error {
 		msgs = append(msgs, m)
+		return nil
 	}
 	wrs := []ReadState{{Index: uint64(1), RequestCtx: []byte("somedata")}}
 
@@ -187,6 +190,38 @@ func TestNodeReadIndex(t *testing.T) {
 	}
 	if !bytes.Equal(msgs[0].Entries[0].Data, wrequestCtx) {
 		t.Errorf("data = %v, want %v", msgs[0].Entries[0].Data, wrequestCtx)
+	}
+}
+
+// TestDisableProposalForwarding ensures that proposals are not forwarded to
+// the leader when DisableProposalForwarding is true.
+func TestDisableProposalForwarding(t *testing.T) {
+	r1 := newTestRaft(1, []uint64{1, 2, 3}, 10, 1, NewMemoryStorage())
+	r2 := newTestRaft(2, []uint64{1, 2, 3}, 10, 1, NewMemoryStorage())
+	cfg3 := newTestConfig(3, []uint64{1, 2, 3}, 10, 1, NewMemoryStorage())
+	cfg3.DisableProposalForwarding = true
+	r3 := newRaft(cfg3)
+	nt := newNetwork(r1, r2, r3)
+
+	// elect r1 as leader
+	nt.send(raftpb.Message{From: 1, To: 1, Type: raftpb.MsgHup})
+
+	var testEntries = []raftpb.Entry{{Data: []byte("testdata")}}
+
+	// send proposal to r2(follower) where DisableProposalForwarding is false
+	r2.Step(raftpb.Message{From: 2, To: 2, Type: raftpb.MsgProp, Entries: testEntries})
+
+	// verify r2(follower) does forward the proposal when DisableProposalForwarding is false
+	if len(r2.msgs) != 1 {
+		t.Fatalf("len(r2.msgs) expected 1, got %d", len(r2.msgs))
+	}
+
+	// send proposal to r3(follower) where DisableProposalForwarding is true
+	r3.Step(raftpb.Message{From: 3, To: 3, Type: raftpb.MsgProp, Entries: testEntries})
+
+	// verify r3(follower) does not forward the proposal when DisableProposalForwarding is true
+	if len(r3.msgs) != 0 {
+		t.Fatalf("len(r3.msgs) expected 0, got %d", len(r3.msgs))
 	}
 }
 
@@ -252,8 +287,9 @@ func TestNodeReadIndexToOldLeader(t *testing.T) {
 // to the underlying raft.
 func TestNodeProposeConfig(t *testing.T) {
 	msgs := []raftpb.Message{}
-	appendStep := func(r *raft, m raftpb.Message) {
+	appendStep := func(r *raft, m raftpb.Message) error {
 		msgs = append(msgs, m)
+		return nil
 	}
 
 	n := newNode()
@@ -316,6 +352,7 @@ func TestNodeProposeAddDuplicateNode(t *testing.T) {
 				n.Tick()
 			case rd := <-n.Ready():
 				s.Append(rd.Entries)
+				applied := false
 				for _, e := range rd.Entries {
 					rdyEntries = append(rdyEntries, e)
 					switch e.Type {
@@ -324,10 +361,13 @@ func TestNodeProposeAddDuplicateNode(t *testing.T) {
 						var cc raftpb.ConfChange
 						cc.Unmarshal(e.Data)
 						n.ApplyConfChange(cc)
-						applyConfChan <- struct{}{}
+						applied = true
 					}
 				}
 				n.Advance()
+				if applied {
+					applyConfChan <- struct{}{}
+				}
 			}
 		}
 	}()
@@ -391,6 +431,49 @@ func TestBlockProposal(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Errorf("blocking proposal, want unblocking")
+	}
+}
+
+func TestNodeProposeWaitDropped(t *testing.T) {
+	msgs := []raftpb.Message{}
+	droppingMsg := []byte("test_dropping")
+	dropStep := func(r *raft, m raftpb.Message) error {
+		if m.Type == raftpb.MsgProp && strings.Contains(m.String(), string(droppingMsg)) {
+			t.Logf("dropping message: %v", m.String())
+			return ErrProposalDropped
+		}
+		msgs = append(msgs, m)
+		return nil
+	}
+
+	n := newNode()
+	s := NewMemoryStorage()
+	r := newTestRaft(1, []uint64{1}, 10, 1, s)
+	go n.run(r)
+	n.Campaign(context.TODO())
+	for {
+		rd := <-n.Ready()
+		s.Append(rd.Entries)
+		// change the step function to dropStep until this raft becomes leader
+		if rd.SoftState.Lead == r.id {
+			r.step = dropStep
+			n.Advance()
+			break
+		}
+		n.Advance()
+	}
+	proposalTimeout := time.Millisecond * 100
+	ctx, cancel := context.WithTimeout(context.Background(), proposalTimeout)
+	// propose with cancel should be cancelled earyly if dropped
+	err := n.Propose(ctx, droppingMsg)
+	if err != ErrProposalDropped {
+		t.Errorf("should drop proposal : %v", err)
+	}
+	cancel()
+
+	n.Stop()
+	if len(msgs) != 0 {
+		t.Fatalf("len(msgs) = %d, want %d", len(msgs), 1)
 	}
 }
 
@@ -695,4 +778,56 @@ func TestIsHardStateEqual(t *testing.T) {
 			t.Errorf("#%d, equal = %v, want %v", i, isHardStateEqual(tt.st, emptyState), tt.we)
 		}
 	}
+}
+
+func TestNodeProposeAddLearnerNode(t *testing.T) {
+	ticker := time.NewTicker(time.Millisecond * 100)
+	defer ticker.Stop()
+	n := newNode()
+	s := NewMemoryStorage()
+	r := newTestRaft(1, []uint64{1}, 10, 1, s)
+	go n.run(r)
+	n.Campaign(context.TODO())
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	applyConfChan := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				n.Tick()
+			case rd := <-n.Ready():
+				s.Append(rd.Entries)
+				t.Logf("raft: %v", rd.Entries)
+				for _, ent := range rd.Entries {
+					if ent.Type != raftpb.EntryConfChange {
+						continue
+					}
+					var cc raftpb.ConfChange
+					cc.Unmarshal(ent.Data)
+					state := n.ApplyConfChange(cc)
+					if len(state.Learners) == 0 ||
+						state.Learners[0] != cc.NodeID ||
+						cc.NodeID != 2 {
+						t.Errorf("apply conf change should return new added learner: %v", state.String())
+					}
+
+					if len(state.Nodes) != 1 {
+						t.Errorf("add learner should not change the nodes: %v", state.String())
+					}
+					t.Logf("apply raft conf %v changed to: %v", cc, state.String())
+					applyConfChan <- struct{}{}
+				}
+				n.Advance()
+			}
+		}
+	}()
+	cc := raftpb.ConfChange{Type: raftpb.ConfChangeAddLearnerNode, NodeID: 2}
+	n.ProposeConfChange(context.TODO(), cc)
+	<-applyConfChan
+	close(stop)
+	<-done
 }
